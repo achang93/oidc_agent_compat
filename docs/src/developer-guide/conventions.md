@@ -58,9 +58,10 @@ never use `anyhow`.
 
 ## Secrets
 
-- **Never literal in config**: the OIDC client secret is referenced by
-  env-var name (`client_secret_env`); provider API keys are managed through
-  the admin API and encrypted in the central database; MCP server
+- **Never literal in config**: central references the OIDC client secret by
+  env-var name (`client_secret_env`); the relay is a public native client and
+  never receives that secret. Provider API keys are managed through the admin
+  API and encrypted in the central database; MCP server
   `auth_header` values are likewise admin-API-managed and AES-256-GCM
   encrypted at rest with the provider encryption key.
 - **`Zeroizing` memory**: provider keys and decrypted MCP auth headers are

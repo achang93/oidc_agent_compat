@@ -31,38 +31,31 @@ See [OIDC Security](./oidc-security.md) for the RFC citations.
 ### Steps
 
 1. `oidc::validate_loopback_redirect(&config.oidc.redirect_uri)` — RFC 8252.
-2. `oidc::resolve_client_secret(&config.oidc)` — reads env var.
-3. `oidc::build_http_client()` — rustls, no redirects (SSRF), timeouts.
-4. OIDC discovery via `CustomProviderMetadata::discover_async`.
-5. Binds one-shot loopback listener `127.0.0.1:0` (random port, RFC 8252
+2. `oidc::build_http_client()` — rustls, no redirects (SSRF), timeouts.
+3. OIDC discovery via `CustomProviderMetadata::discover_async`.
+4. Binds one-shot loopback listener `127.0.0.1:0` (random port, RFC 8252
    §7.3); substitutes actual port into redirect URI.
-6. Builds `CustomClient` from provider metadata + `ClientId` +
-   `ClientSecret`.
-7. Generates PKCE S256 (`PkceCodeChallenge::new_random_sha256`),
+5. Builds a public `CustomClient` from provider metadata + `ClientId`; the
+   relay does not load or receive the client secret.
+6. Generates PKCE S256 (`PkceCodeChallenge::new_random_sha256`),
    `state` (`CsrfToken::new_random`), `nonce` (`Nonce::new_random`).
-8. Builds authorize URL with scopes (`openid` always first).
-9. Prints URL + calls `open_browser(url)` (macOS `open`, Linux
+7. Builds authorize URL with scopes (`openid` always first).
+8. Prints URL + calls `open_browser(url)` (macOS `open`, Linux
    `xdg-open`, Windows `cmd /C start`).
-10. `wait_for_callback(listener, CALLBACK_TIMEOUT)` —
+9. `wait_for_callback(listener, CALLBACK_TIMEOUT)` —
     `CALLBACK_TIMEOUT = 300s` (5 min).
-11. Verifies `state` (CSRF defense).
-12. Exchanges code with PKCE verifier.
-13. ID-token validation:
-    - 13a. **Alg pin**: `is_allowed_alg` accepts only RS256 + ES256.
-      Checked **before** signature verification.
-    - 13b. `id_token.claims(&client.id_token_verifier(), &nonce)` —
-      verifies iss, aud, exp, nonce, signature via JWKS.
-    - 13c. `at_hash` validation (OIDC Core §3.1.3.7 step 3) if present.
-14. Fetches userinfo; falls back to `claims_from_id_token` on failure.
-    Extracts subject, email, display_name, groups.
-15. Calls `complete_login()`.
+10. Verifies `state` (CSRF defense).
+11. Calls `complete_login()` with the one-time authorization code, PKCE
+    verifier, exact redirect URI, and nonce. Central performs the token
+    exchange, ID-token validation, `at_hash` check, and userinfo request.
 
 ### `complete_login()`
 
-1. `key_store.upsert_identity(issuer, subject, email, display_name, groups)`.
-2. `POST {central}/v1/tokens` — mints a central token.
-3. Builds `AgentConfig { base_url, api_key }` with the minted token.
-4. `agent_config::inject(&agent_config)` — writes with `0600` perms.
+1. `POST {central}/v1/tokens` — sends the short-lived grant over mTLS.
+2. Central returns a minted token plus the identity it validated.
+3. `key_store.upsert_identity(...)` stores only that verified identity.
+4. Builds `AgentConfig { base_url, api_key }` with the minted token.
+5. `agent_config::inject(&agent_config)` — writes with `0600` perms.
 
 ### `wait_for_callback()`
 

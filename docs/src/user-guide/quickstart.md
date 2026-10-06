@@ -70,9 +70,8 @@ dev_mode = false
 
 [oidc]
 issuer = "https://idp.example.com/realms/your-realm"   # ← your IdP
-# Central does not log in/validate tokens itself — identity comes from the
-# relay over mTLS. client_id is not used at runtime; oac-relay is the RP.
-client_id = "oac-central"
+# Must match the public client_id configured on every relay.
+client_id = "oac-relay"
 client_secret_env = "OAC_OIDC_CLIENT_SECRET"
 redirect_uri = "http://127.0.0.1:0/callback"
 scopes = ["openid"]
@@ -159,7 +158,7 @@ dev_mode = false
 [oidc]
 issuer = "https://idp.example.com/realms/your-realm"
 client_id = "oac-relay"
-client_secret_env = "OAC_OIDC_CLIENT_SECRET"
+client_secret_env = ""
 redirect_uri = "http://127.0.0.1:0/callback"
 # "groups" is REQUIRED for group-based policy enforcement and admin access.
 scopes = ["openid", "email", "profile", "groups"]
@@ -176,9 +175,6 @@ client_key_path = "/home/you/.oac/certs/client.key"
 ## Step 6: Log in and start the relay
 
 ```sh
-# Set the OIDC client secret:
-export OAC_OIDC_CLIENT_SECRET="your-oidc-client-secret"
-
 # Log in (opens browser, runs OIDC auth-code + PKCE flow):
 oac-relay --config ~/.oac/relay.toml login
 

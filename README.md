@@ -79,8 +79,7 @@ cp target/release/oac-relay /usr/local/bin/oac-relay
 cp docker/prod/configs/relay.toml ~/.oac/relay.toml
 # Copy ca.crt, client.crt, client.key to ~/.oac/certs/
 
-# 6. Log in and start the relay:
-export OAC_OIDC_CLIENT_SECRET="your-secret"
+# 6. Log in and start the relay (the client secret remains on central):
 oac-relay --config ~/.oac/relay.toml login
 oac-relay --config ~/.oac/relay.toml serve
 

@@ -38,7 +38,7 @@ Agent (Codex, etc.)
 | MCP server auth headers | Central DB ciphertext (`mcp_servers`) → `Zeroizing` memory during forwarding | **CRITICAL** — never on laptop, never returned by any API |
 | Central-minted tokens (plaintext) | Agent config file (`0600`) | Medium — loopback-only, revocable at central |
 | Token hashes | Central DB | Low — SHA-256 hashes, constant-time compare |
-| OIDC ID tokens | In transit only (not stored in v1) | Medium — short-lived |
+| OIDC authorization codes, PKCE verifiers, ID/access tokens | In transit only between relay, central, and IdP; never stored | Medium — short-lived; never logged |
 | User identity (subject, email) | Relay + central DB, audit log | Medium — PII |
 | Audit log | Central DB (append-only) | Medium — tamper-evident |
 
@@ -52,9 +52,10 @@ Agent (Codex, etc.)
 | Attacker spoofs the relay to the central proxy | mTLS with company CA (client cert required) | ✅ Implemented |
 | Attacker spoofs the IdP | OIDC discovery + JWKS signature verification + alg pin {RS256, ES256} | ✅ Implemented |
 | Attacker spoofs the central proxy to the relay | mTLS with company CA (server cert verification) | ✅ Implemented |
-| Attacker spoofs the user identity to the central proxy | Identity extracted from the central token record (not from relay-forwarded headers); `X-OAC-*` identity headers ignored | ✅ Implemented |
+| Attacker spoofs the user identity to the central proxy | Initial bootstrap identity is derived by central from its own authorization-code exchange and ID-token/userinfo validation; later requests use the central token record; caller identity fields and `X-OAC-*` identity headers are ignored | ✅ Implemented |
 | Attacker spoofs the Host header (DNS rebinding) | Host header validation middleware (loopback only) | ✅ Implemented |
 | Attacker spoofs the OIDC redirect (mix-up) | `state` (CSRF) + `nonce` (replay) + loopback redirect only | ✅ Implemented |
+| Stolen or replayed authorization code is exchanged | PKCE S256 binds the one-time code to the verifier; central supplies the exact loopback redirect URI and consumes the code at the IdP token endpoint | ✅ Implemented |
 
 ### T — Tampering
 
@@ -104,14 +105,14 @@ Agent (Codex, etc.)
 | Threat | Control | Status |
 |---|---|---|
 | Unauthenticated user accesses relay | Auth middleware (401 without Authorization header; central verifies token) | ✅ Implemented |
-| Unauthenticated request reaches backend | Central auth middleware (401 without valid bearer token; verifies via TokenStore) | ✅ Implemented |
+| Unauthenticated request reaches backend | Central auth middleware requires a valid TokenStore bearer in every mode, including `dev_mode` | ✅ Implemented |
 | Attacker bypasses auth via healthz | `/healthz` exempt from auth (returns only "ok", no data) | ✅ Implemented |
 | Attacker uses revoked token | Token row deleted on logout/revoke; `verify_token` checks current tokens only | ✅ Implemented |
 | Attacker exploits `unsafe` code | `#![forbid(unsafe_code)]` across all crates | ✅ Implemented |
 | Authenticated user calls disallowed model | Permissions middleware enforces group-based model allowlists (403) | ✅ Implemented |
 | Authenticated user calls disallowed endpoint | Permissions middleware enforces group-based endpoint restrictions (403) | ✅ Implemented |
 | Authenticated user exceeds quota | Per-user daily request and token quotas enforced pre-flight against accumulated daily usage (429) | ✅ Implemented (a request may overshoot by its own completed usage) |
-| Attacker spoofs group membership | Groups stored in central token record (originally extracted from IdP-signed ID token at login time) | ✅ Implemented |
+| Attacker spoofs group membership | Central ignores request-body group fields and stores only groups from its validated ID token or subject-bound TLS userinfo response | ✅ Implemented |
 | Admin API accessed without authorization | Admin auth middleware verifies bearer token via TokenStore, checks group membership from token record; 403 if not in admin group | ✅ Implemented |
 | Admin API mutations go unlogged | All mutations recorded in append-only `admin_audit_log` | ✅ Implemented |
 | Revoked device continues to access | Devices auto-register on first verified request; revocation checked in `permissions_middleware` (uses `identity_id` or `subject` as device ID) | ✅ Implemented |

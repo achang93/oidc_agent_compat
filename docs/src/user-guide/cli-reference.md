@@ -54,8 +54,11 @@ The `--ttl` flag sets the token lifetime (e.g. `--ttl 1d`, `--ttl 12h`,
 `max_token_ttl_seconds` backstop clamps it).
 
 Opens a browser to the IdP login page. After successful authentication,
-requests a central-minted token via `POST /v1/tokens` and writes the agent
-config file with `0600` perms. The Codex config (`$CODEX_HOME/config.json`, or
+the relay sends the one-time authorization code, PKCE verifier, redirect URI,
+and nonce to `POST /v1/tokens` over mTLS. Central exchanges and validates the
+grant, derives the identity from verified OIDC claims, and returns a minted
+token. The relay writes the agent config file with `0600` perms. The Codex
+config (`$CODEX_HOME/config.json`, or
 `~/.codex/config.json`) is used only if `CODEX_HOME` is set or
 `~/.codex/config.json` already exists; otherwise the generic env file
 `~/.oac/agent-env.sh` is written.

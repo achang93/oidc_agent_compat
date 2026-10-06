@@ -77,8 +77,24 @@ Routes (OpenAI paths are the same set the relay exposes):
 | `POST` | `/v1/responses` | required |
 | `GET` | `/v1/models` | required |
 | `POST` | `/v1/embeddings` | required |
+| `POST` | `/v1/tokens` | OIDC code exchange or existing bearer |
+| `GET` | `/v1/tokens` | existing bearer |
+| `DELETE` | `/v1/tokens/current`, `/v1/tokens/{id}` | existing bearer |
 | any | `/mcp/{server}` | required (per-tool MCP middleware) |
 | `POST` only | `/mcp` (hub) | required (hub handler enforces inline) |
+
+## OIDC bootstrap (`oidc_bootstrap.rs`, `proxy/tokens.rs`)
+
+For initial login, the relay sends a one-time authorization code, PKCE
+verifier, loopback redirect URI, and nonce to `POST /v1/tokens` over mTLS.
+`OidcBootstrapVerifier` uses the client secret held by central to exchange the
+code, pins the ID-token algorithm to RS256/ES256, validates issuer, audience,
+expiry, nonce, signature, and optional `at_hash`, then requests userinfo with
+subject matching. Only this centrally validated identity can be persisted in a
+token record; caller-supplied identity or group fields are ignored.
+
+The endpoint's existing-bearer mode copies the complete identity snapshot from
+the verified token record and accepts only the new label and TTL from the body.
 
 ## Auth middleware (`proxy/auth.rs`)
 
@@ -102,8 +118,8 @@ pub struct VerifiedRelayIdentity {
 - Extracts the bearer token from the `Authorization` header.
 - Verifies it via `state.token_store.verify_token()` (DB lookup,
   constant-time hash comparison, no early return — CWE-208).
-- Missing/unverifiable → `401` (unless `dev_mode`, which allows through
-  with a warning).
+- Missing/unverifiable → `401` in every mode. `dev_mode` relaxes transport
+  and rate limiting, never bearer verification.
 - `X-OAC-*` identity headers are **ignored** — identity comes from the
   token record.
 - Inserts `VerifiedRelayIdentity` (with `token_id` and `created_at` for

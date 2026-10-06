@@ -397,8 +397,10 @@ use the admin auth middleware.
 Mint a new opaque token. This endpoint serves two authentication modes:
 
 1. **Login flow** (relay during OIDC login, no `Authorization` header): the
-   identity (subject, issuer, email, groups, identity_id) is carried in the
-   request body fields. `subject`, `issuer`, and `label` are required.
+   request carries the one-time authorization code, PKCE verifier, exact
+   loopback redirect URI, and nonce. Central exchanges the code with the IdP,
+   validates the ID token, and derives identity and groups itself. Supplied
+   identity fields are ignored.
 2. **Token-create flow** (`oac-relay token create`, with `Authorization:
    Bearer`): a valid bearer is verified against the token store, and the
    identity is taken from the verified token record. The body carries only
@@ -408,12 +410,10 @@ Mint a new opaque token. This endpoint serves two authentication modes:
 
 ```json
 {
-  "subject": "user-123",
-  "issuer": "https://idp.example.com",
-  "email": "user@example.com",
-  "display_name": "User Name",
-  "groups": "[\"engineering\"]",
-  "identity_id": "uuid-from-relay",
+  "authorization_code": "one-time-code-from-idp",
+  "pkce_verifier": "pkce-verifier",
+  "redirect_uri": "http://127.0.0.1:49152/callback",
+  "nonce": "authorization-request-nonce",
   "label": "default",
   "ttl_seconds": null
 }
@@ -428,9 +428,10 @@ Mint a new opaque token. This endpoint serves two authentication modes:
 }
 ```
 
-`ttl_seconds` is optional (`null` = never expires). The requested TTL is
-clamped to the admin `max_token_ttl_seconds` backstop if set. The plaintext
-token is returned once and never persisted or logged.
+The authorization code and PKCE verifier are short-lived secrets and must not
+be logged. `ttl_seconds` is optional (`null` = never expires). The requested
+TTL is clamped to the admin `max_token_ttl_seconds` backstop if set. The
+plaintext token is returned once and never persisted or logged.
 
 **Response:** `201 Created`
 
@@ -438,7 +439,12 @@ token is returned once and never persisted or logged.
 {
   "token": "oac_...",
   "token_id": "uuid",
-  "expires_at": "2026-09-05 12:00:00"
+  "expires_at": "2026-09-05 12:00:00",
+  "issuer": "https://idp.example.com",
+  "subject": "user-123",
+  "email": "user@example.com",
+  "display_name": "User Name",
+  "groups": "[\"engineering\"]"
 }
 ```
 

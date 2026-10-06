@@ -20,6 +20,26 @@ Agent ──HTTP──► Relay ──mTLS──► Central ──HTTPS──►
                   └─ Activity log
 ```
 
+## Login bootstrap: relay → central → IdP
+
+1. Relay starts the OIDC authorization request as a public native client with
+   PKCE S256, `state`, `nonce`, and a random loopback redirect port.
+2. Relay receives the authorization code and verifies `state`.
+3. Relay sends the one-time code, PKCE verifier, exact redirect URI, and nonce
+   to central's `POST /v1/tokens` over mTLS. It does not send identity claims.
+4. Central, which alone holds the client secret, exchanges the code with the
+   IdP and validates the ID token (`iss`, `aud`, `exp`, nonce, signature,
+   RS256/ES256 pin, and optional `at_hash`). Central fetches userinfo with an
+   expected-subject check and falls back to the validated ID-token claims.
+5. Central resolves policy from those verified groups, stores the identity
+   snapshot with the new opaque token, and returns the plaintext once. Relay
+   stores the returned identity locally and injects the token into the agent
+   config.
+
+Authorization codes and PKCE verifiers are short-lived secrets, are not
+`Debug`, and are never logged. JSON fields claiming a subject, issuer, group,
+or identity ID cannot influence bootstrap authorization.
+
 ## Step 1: Agent → Relay
 
 The agent sends a standard OpenAI-compatible request:
@@ -94,8 +114,7 @@ User-Agent: codex/1.0
    - Verifies it via `TokenStore::verify_token()` (DB lookup,
      constant-time hash comparison, no early return — prevents timing
      leaks, CWE-208). Expired tokens are deleted.
-   - Missing/unverifiable → `401 Unauthorized` (unless `dev_mode`, which
-     allows through with a warning).
+   - Missing/unverifiable → `401 Unauthorized` in every mode.
    - `X-OAC-*` identity headers are **ignored** — identity comes from the
      token record.
    - Inserts `VerifiedRelayIdentity` (with `token_id` and `created_at` for

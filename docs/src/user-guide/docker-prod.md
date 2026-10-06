@@ -100,10 +100,9 @@ dev_mode = false
 
 [oidc]
 issuer = "https://idp.example.com/realms/your-realm"
-# Central verifies bearer tokens via its TokenStore. Identity comes from
-# the token record (originally extracted from the IdP-signed ID token at
-# login time). client_id is not used at runtime; oac-relay is the RP.
-client_id = "oac-central"
+# Central exchanges the relay's authorization code and validates the IdP
+# response. This client_id must match the relay's public client_id.
+client_id = "oac-relay"  # must match the relay's public client_id
 client_secret_env = "OAC_OIDC_CLIENT_SECRET"
 redirect_uri = "http://127.0.0.1:0/callback"
 scopes = ["openid"]
@@ -157,7 +156,7 @@ dev_mode = false
 [oidc]
 issuer = "https://idp.example.com/realms/your-realm"
 client_id = "oac-relay"
-client_secret_env = "OAC_OIDC_CLIENT_SECRET"
+client_secret_env = ""
 redirect_uri = "http://127.0.0.1:0/callback"
 # "groups" is REQUIRED for group-based policy enforcement and admin access.
 scopes = ["openid", "email", "profile", "groups"]
@@ -173,9 +172,6 @@ client_key_path = "/home/you/.oac/certs/client.key"
 ### Run
 
 ```sh
-# Set the OIDC client secret:
-export OAC_OIDC_CLIENT_SECRET="your-secret"
-
 # Log in (opens browser, requests central-minted token, injects into agent config):
 oac-relay --config ~/.oac/relay.toml login
 
@@ -223,7 +219,8 @@ Before going live, verify every item on this checklist:
 - [ ] Central `url` in relay config is `https://` (mTLS enforced).
 - [ ] OIDC `issuer` points to your real enterprise IdP (not a dev
   Keycloak).
-- [ ] `client_secret_env` references an env var, never a literal secret.
+- [ ] Central's `client_secret_env` references an env var, never a literal
+  secret; relay's field is empty.
 - [ ] `[admin]` section's `admin_group` matches a real group in your IdP.
 
 ### Secrets

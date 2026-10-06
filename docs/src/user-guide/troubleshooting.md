@@ -47,9 +47,10 @@ If you see `Address already in use`, another process is bound to port
 
 ### Dev token not found
 
-The dev token is minted by `docker/dev.sh up` via `POST /v1/tokens` at
-central. If you're running in production mode, you must run `oac-relay
-login` to get a central-minted token.
+The dev token is minted by `docker/dev.sh up` through central's hidden,
+dev-mode-only local CLI. The public `POST /v1/tokens` endpoint never accepts
+caller-supplied identity claims. If you're running in production mode, you
+must run `oac-relay login` to complete OIDC and get a central-minted token.
 
 ## Central proxy
 

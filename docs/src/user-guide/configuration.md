@@ -30,7 +30,7 @@ All configs are parsed and validated by
 |---|---|---|---|
 | `issuer` | `String` | yes | Non-empty; must start with `http://` or `https://` |
 | `client_id` | `String` | yes | Non-empty |
-| `client_secret_env` | `String` | yes | Non-empty — **name** of env var holding the secret (never the secret itself) |
+| `client_secret_env` | `String` | yes | Ignored by relay; set to `""` because the relay is a public native client |
 | `redirect_uri` | `String` | yes | Must be a loopback `http://127.0.0.1` URL; the host is parsed and verified (e.g. `http://127.0.0.1.evil.com/cb` is rejected) |
 | `scopes` | `Vec<String>` | yes | e.g. `["openid", "email", "profile", "groups"]` |
 
@@ -60,7 +60,7 @@ dev_mode = false
 [oidc]
 issuer = "https://idp.example.com"
 client_id = "oac-relay"
-client_secret_env = "OAC_OIDC_CLIENT_SECRET"
+client_secret_env = ""
 redirect_uri = "http://127.0.0.1:0/callback"
 scopes = ["openid", "email", "profile", "groups"]
 
@@ -85,7 +85,7 @@ client_key_path = "/etc/oac/client.key"
 | `mtls` | table | yes | — | See [mTLS server](#mtls-server) below |
 | `admin` | table | no | `None` (admin API disabled) | See [Admin](#admin) below |
 | `pricing` | table | no | `None` (no cost tracking; `cost_usd` always `0.0`) | See [Pricing](#pricing) below |
-| `dev_mode` | `bool` | no | `false` | When `true`: plain HTTP, permissive identity handling, and the rate limiter is disabled (`rate_limit_*` ignored) |
+| `dev_mode` | `bool` | no | `false` | When `true`: plain HTTP and the rate limiter is disabled (`rate_limit_*` ignored); bearer verification remains mandatory |
 | `rate_limit_requests` | `u32` | no | `60` | Maximum requests per client IP per rate-limit window; must be greater than zero |
 | `rate_limit_window_secs` | `u64` | no | `60` | Token-bucket window in seconds; must be greater than zero |
 
@@ -96,7 +96,8 @@ back off for exactly the right duration instead of retrying in a tight loop.
 
 ### OIDC
 
-Same shape as the relay's OIDC config:
+Same serialized shape as the relay's OIDC config, but central requires and
+uses the client secret for the authorization-code exchange:
 
 | Field | Type | Required | Validation |
 |---|---|---|---|
@@ -174,7 +175,7 @@ rate_limit_window_secs = 60
 
 [oidc]
 issuer = "https://idp.example.com"
-client_id = "oac-central"
+client_id = "oac-relay" # must match the relay's public client_id
 client_secret_env = "OAC_OIDC_CLIENT_SECRET"
 redirect_uri = "http://127.0.0.1:0/callback"
 scopes = ["openid"]
@@ -202,7 +203,7 @@ output_per_1k_usd = 0.01
 
 | Variable | Used by | Description |
 |---|---|---|
-| `OAC_OIDC_CLIENT_SECRET` | Both | OIDC client secret (referenced by `client_secret_env` in config) |
+| `OAC_OIDC_CLIENT_SECRET` | Central | OIDC client secret (referenced by central's `client_secret_env`; never needed on a relay laptop) |
 | `OAC_PROVIDER_ENCRYPTION_KEY` | Central | 64-hex-character key used to encrypt provider API keys at rest |
 | `OAC_RELAY_CONFIG` | Relay | Path to config file (alternative to `--config`) |
 | `OAC_CENTRAL_CONFIG` | Central | Path to config file (alternative to `--config`) |

@@ -68,8 +68,11 @@ Multi-stage build, central proxy only:
 The dev central receives its provider encryption key via the
 `OAC_PROVIDER_ENCRYPTION_KEY` env var (a fixed dev 64-hex value in the
 compose file). After healthchecks pass, `docker/dev.sh up` registers the
-mock provider and its key through the admin API using dev-mode identity
-headers — there is no init container and no key file on disk.
+mock provider and its key through the admin API. It first invokes the hidden
+`oac-central dev-token` command inside the central container; that command
+requires `dev_mode = true` and mints directly through local database access,
+so the public HTTP bootstrap endpoint never accepts caller-claimed identity.
+There is no init container and no key file on disk.
 
 ### Volumes
 

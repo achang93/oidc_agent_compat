@@ -32,9 +32,15 @@ against your enterprise IdP (Okta, Keycloak, etc.):
 - **Loopback redirect** (RFC 8252) — the IdP redirects to
   `http://127.0.0.1:<random-port>/callback`, which only your local relay
   can receive.
-- **ID token validation** — the relay verifies the ID token signature
-  (alg pinned to RS256 or ES256), issuer, audience, expiry, nonce, and
-  `at_hash`.
+- **Central validation** — the relay sends the one-time authorization code,
+  PKCE verifier, redirect URI, and nonce to central over mTLS. Central performs
+  the token exchange and verifies the ID token signature (alg pinned to RS256
+  or ES256), issuer, audience, expiry, nonce, and `at_hash`.
+- **No laptop client secret** — the relay is a public native client. The OIDC
+  client secret is configured only on central.
+- **No caller-claimed identity** — central ignores subject, issuer, email,
+  group, and identity-ID fields supplied by callers. Policies use only claims
+  obtained from central's validated IdP response.
 - **Token lifetime** — central-minted tokens have a lifetime set by the
   `--ttl` flag on `oac-relay login` (e.g. `--ttl 1d`, `--ttl 1y`). Default:
   never expires. An admin can set `max_token_ttl_seconds` on group policies as
@@ -63,6 +69,8 @@ company CA:
 - **Constant-time comparison** — token verification uses
   `subtle::ConstantTimeEq` with no early return (prevents timing attacks,
   CWE-208).
+- **Required in every mode** — central rejects missing or invalid bearer
+  tokens even when local Docker development uses `dev_mode = true`.
 - **`0600` file permissions** — the agent config file (containing the
   plaintext token) is readable only by you.
 - **`Zeroizing` memory** — plaintext tokens are held in `Zeroizing` wrappers

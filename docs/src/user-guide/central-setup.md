@@ -20,7 +20,7 @@ dev_mode = false
 
 [oidc]
 issuer = "https://idp.example.com"
-client_id = "oac-central"
+client_id = "oac-relay" # must match the relay's public client_id
 client_secret_env = "OAC_OIDC_CLIENT_SECRET"
 redirect_uri = "http://127.0.0.1:0/callback"
 scopes = ["openid"]
@@ -37,8 +37,8 @@ admin_group = "oac-admins"
 Key points:
 
 - `listen_addr` is `0.0.0.0:8443` (network-accessible) in production.
-- `dev_mode = false` enforces mTLS and rejects requests without
-  bearer token verification.
+- `dev_mode = false` enforces mTLS. Bearer-token verification is mandatory
+  in both production and development modes.
 - Provider and key records are not in the TOML file. Add them with the admin
   API after central starts.
 - `[admin]` is optional. If present, the admin API is enabled and
@@ -52,10 +52,11 @@ Set the OIDC client secret:
 export OAC_OIDC_CLIENT_SECRET="your-oidc-client-secret"
 ```
 
-Note: the `[oidc]` section is schema-required and validated, but central
-never performs an OIDC login at runtime — it trusts relay-forwarded
-the bearer token over mTLS. The env var only needs to exist for config
-loading (the Docker stack sets it automatically).
+Central uses this confidential-client registration to exchange the one-time
+authorization code received from a relay and independently validate the ID
+token and userinfo response. Its `client_id`, issuer, and redirect policy must
+match the public authorization request configured on the relay; only central
+receives the client secret.
 
 Set the provider-key encryption key through your secret manager or Docker
 secret. For local development only, an environment variable can be used:

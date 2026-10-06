@@ -191,7 +191,7 @@ Key modules:
 - `crates/common/src/keys.rs` — opaque token generation (256-bit CSPRNG, `oac_` prefix), SHA-256 hashing, constant-time compare, bearer extraction.
 - `crates/common/src/oidc.rs` — OIDC RP client builder + `CustomAdditionalClaims` (groups/roles extraction).
 - `crates/common/src/mtls.rs` — rustls mTLS client/server builders.
-- `crates/relay/src/login.rs` — `oac-relay login`: auth-code + PKCE flow, loopback callback, ID-token validation, agent config injection.
+- `crates/relay/src/login.rs` — `oac-relay login`: browser + PKCE flow, loopback callback, secure grant handoff, agent config injection.
 - `crates/relay/src/proxy/` — `mod.rs`, `auth.rs` (pass-through — checks Authorization header presence, does not verify), `forward.rs` (relay→central, forwards Authorization header unchanged), `host_guard.rs` (DNS rebinding defense), `mcp_forward.rs` (byte-tunnel for `/mcp` and `/mcp/{server}`).
 - `crates/relay/src/keystore.rs` (OIDC identity storage only — `upsert_identity`; no key methods), `agent_config.rs`, `db.rs`, `migration.rs`, `entity/` — persistence + agent config injection.
 - `crates/relay/src/activity.rs` — relay-side activity logger (append-only `relay_activity_log`).
@@ -199,6 +199,7 @@ Key modules:
 - `crates/central/src/mcp.rs` — MCP server registry; `auth_header` values AES-256-GCM encrypted at rest with the provider encryption key.
 - `crates/central/src/admin.rs` — admin API (`/admin/v1/`) for policy/provider/device/audit/MCP management.
 - `crates/central/src/proxy/tokens.rs` — token API (`POST /v1/tokens` mint, `DELETE /v1/tokens/current` revoke, `GET /v1/tokens` list).
+- `crates/central/src/oidc_bootstrap.rs` — confidential-client code exchange, ID-token validation, and verified bootstrap identity extraction.
 - `crates/central/src/policy.rs` — `PolicyStore` + `resolve_policy` (group→policy merge, most-permissive-wins).
 - `crates/central/src/device_store.rs` — device registration + revocation store.
 - `crates/central/src/provider.rs` — runtime provider/key store; provider keys are AES-256-GCM encrypted at rest with the configured MEK.
@@ -243,8 +244,9 @@ Minimum Rust 1.85; edition 2024.
 - `missing_docs` is warn — document public items.
 - Library code returns `oidc_agent_common::error::Result` (thiserror-based
   `Error` enum). Reserve `anyhow` for binary `main` glue if needed.
-- Secrets are never literals in config: OIDC client secret is referenced by
-  env-var name (`client_secret_env`); provider API keys are managed through
+- Secrets are never literals in config: central references the OIDC client
+  secret by env-var name (`client_secret_env`), while the public native relay
+  never receives it; provider API keys are managed through
   the admin API and encrypted at rest. Provider keys are held in
   `Zeroizing` memory during forwarding, never logged, never sent to a
   laptop.
@@ -261,11 +263,13 @@ reference.
 
 ## OIDC login flow (security-critical)
 
-`crates/relay/src/login.rs` implements the full auth-code + PKCE flow. When
-editing, follow RFC 8252 (loopback redirect, any port), RFC 7636/9700 (PKCE
-S256 mandatory), OIDC Core §3.1.3.7 (ID-token validation). The ID-token alg
-is pinned to {RS256, ES256}; `none` is disallowed. `state`/`nonce` are
-verified; `at_hash` validation is implemented (step 13c). See
+`crates/relay/src/login.rs` owns the browser, loopback callback, PKCE, and
+state check; `crates/central/src/oidc_bootstrap.rs` owns the confidential
+code exchange and authorization-relevant claim validation. When editing,
+follow RFC 8252 (loopback redirect, any port), RFC 7636/9700 (PKCE S256
+mandatory), and OIDC Core §3.1.3.7 (ID-token validation). The ID-token alg is
+pinned to {RS256, ES256}; `none` is disallowed. `state` is verified by the
+relay; `nonce` and `at_hash` are verified by central. See
 `/memories/repo/oidc-security-research.md` for the full RFC citation list.
 
 Manual verification: run `oac-relay login` on the **host** against dev

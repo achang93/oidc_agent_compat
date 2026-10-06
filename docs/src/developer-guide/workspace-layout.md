@@ -52,7 +52,7 @@ crates/mcp/src/
 crates/relay/src/
 ├── lib.rs              # Lib exposed for integration tests
 ├── main.rs             # Binary: CLI dispatch, serve()
-├── login.rs            # OIDC auth-code + PKCE flow, ID-token validation, agent config injection
+├── login.rs            # Browser + PKCE flow, secure grant handoff, agent config injection
 ├── keystore.rs         # KeyStore: OIDC identity upsert only (no key methods)
 ├── db.rs               # Relay DB setup
 ├── migration.rs        # SeaORM migrations (4 migrations)
@@ -92,6 +92,7 @@ crates/central/src/
 ├── pricing.rs          # PriceTable (model cost computation, auto-fetch from backend)
 ├── optimizer.rs        # Token saver (dedupe, empty-message pruning, budget drops, opt-in collapses)
 ├── token_store.rs      # Central token store (zero-trust): mint, verify, revoke, list
+├── oidc_bootstrap.rs   # Confidential-client code exchange + ID-token validation
 ├── proxy/
 │   ├── mod.rs          # Router, AppState, serve() (includes token_store)
 │   ├── auth.rs         # Verifies bearer token via TokenStore (zero-trust)

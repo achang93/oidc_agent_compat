@@ -1,8 +1,9 @@
 # OIDC Security
 
-The relay's OIDC login flow (`crates/relay/src/login.rs`) implements the
-full authorization-code + PKCE flow. This page documents the security
-controls and RFC compliance.
+OIDC login is split between the native relay (`crates/relay/src/login.rs`)
+and central (`crates/central/src/oidc_bootstrap.rs`). The relay owns the
+browser and loopback callback; central owns the client secret, token exchange,
+and all authorization-relevant claim validation.
 
 ## RFC compliance
 
@@ -17,7 +18,7 @@ controls and RFC compliance.
 | OWASP ASVS V2/V3 | Auth, session, federated auth controls | ✅ |
 | CWE-208 | Constant-time comparison (timing attack prevention) | ✅ `subtle::ConstantTimeEq`, no early return |
 
-## Login flow (15 steps)
+## Login flow
 
 1. **Loopback redirect validation** — `validate_loopback_redirect()`:
    - Requires scheme `http` and loopback IP host (`127.0.0.0/8` or `::1`).
@@ -25,75 +26,81 @@ controls and RFC compliance.
      bypasses like `127.0.0.1.evil.com`.
    - RFC 8252.
 
-2. **Client secret resolution** — `resolve_client_secret()`: reads from
-   env var named by `client_secret_env`. Never a literal in config.
-
-3. **HTTP client** — `build_http_client()`:
+2. **Relay HTTP client** — `build_http_client()`:
    - `redirect::Policy::none()` — no redirects (SSRF prevention).
    - `use_rustls_tls()` — rustls, not native-tls.
    - `CONNECT_TIMEOUT = 10s`, `REQUEST_TIMEOUT = 30s`.
 
-4. **OIDC discovery** — `CustomProviderMetadata::discover_async()`.
+3. **Relay OIDC discovery** — `CustomProviderMetadata::discover_async()`.
 
-5. **Loopback listener** — binds `127.0.0.1:0` (random port, RFC 8252
+4. **Loopback listener** — binds `127.0.0.1:0` (random port, RFC 8252
    §7.3). Substitutes actual port into redirect URI.
 
-6. **Client construction** — `CustomClient` from provider metadata +
-   `ClientId` + `ClientSecret`.
+5. **Public native client construction** — `CustomClient` from provider
+   metadata + `ClientId`, with no client secret on the laptop.
 
-7. **PKCE + state + nonce**:
+6. **PKCE + state + nonce**:
    - PKCE: `PkceCodeChallenge::new_random_sha256` (S256, RFC 7636/9700).
    - `state`: `CsrfToken::new_random` (CSRF defense).
    - `nonce`: `Nonce::new_random` (replay defense).
 
-8. **Authorize URL** — scopes: `openid` always added first; configured
+7. **Authorize URL** — scopes: `openid` always added first; configured
    scopes filtered to skip `openid` (avoid duplicate).
 
-9. **Browser launch** — `open_browser(url)`:
+8. **Browser launch** — `open_browser(url)`:
    - macOS: `open <url>`
    - Linux: `xdg-open <url>`
    - Windows: `cmd /C start <url>`
 
-10. **Callback wait** — `wait_for_callback(listener, 300s)`:
+9. **Callback wait** — `wait_for_callback(listener, 300s)`:
     - `tokio::time::timeout(300s, listener.accept())`.
     - Reads request with 10s sub-timeout.
     - Parses `GET /callback?code=...&state=... HTTP/1.1`.
     - If `error` param present → `Error::oidc`.
     - Writes minimal HTML response.
 
-11. **State verification** — compares returned `state` against the one
+10. **State verification** — compares returned `state` against the one
     sent (CSRF defense).
 
-12. **Token exchange** — `client.exchange_code(code)
-    .set_pkce_verifier(verifier).request_async(&http_client)`.
+11. **Secure handoff to central** — relay sends the one-time authorization
+    code, PKCE verifier, exact loopback redirect URI, and nonce to
+    `POST {central}/v1/tokens` over mTLS. These values are not `Debug` and are
+    never logged. Caller-supplied subject, issuer, email, display name,
+    groups, and identity IDs are not accepted.
 
-13. **ID-token validation**:
-    - 13a. **Alg pin** — `is_allowed_alg()` accepts only:
+12. **Central confidential-client setup and token exchange** — central reads
+    the client secret from the environment variable named by
+    `client_secret_env`, discovers the configured issuer, validates that the
+    supplied redirect URI is loopback, then calls `exchange_code()` with the
+    PKCE verifier and exact redirect URI.
+
+13. **Central ID-token validation**:
+    - **Alg pin** — `is_allowed_alg()` accepts only:
       - `RS256` (`RsaSsaPkcs1V15Sha256`)
       - `ES256` (`EcdsaP256Sha256`)
       - Rejects `none`, all `HS*`, and other RSA/ECDSA variants.
       - Checked **before** signature verification.
-    - 13b. **Claims verification** — `id_token.claims(&verifier, &nonce)`:
+    - **Claims verification** — `id_token.claims(&verifier, &nonce)`:
       - `iss` (issuer) matches.
       - `aud` (audience) matches `client_id`.
       - `exp` (expiry) in the future.
       - `nonce` matches the one sent.
       - Signature verified via JWKS.
-    - 13c. **`at_hash` validation** (OIDC Core §3.1.3.7 step 3) — if
+    - **`at_hash` validation** (OIDC Core §3.1.3.7 step 3) — if
       the IdP includes `at_hash`, verifies it against the access token.
       Prevents token substitution.
 
-14. **Userinfo** — `client.user_info(...)`. Falls back to
+14. **Central userinfo** — `client.user_info(...)`. Falls back to
     `claims_from_id_token()` on userinfo failure. Extracts:
     - `subject` (sub claim).
     - `email` (email claim).
     - `display_name` (name → preferred_username).
     - `groups` (via `union_groups_roles` + `groups_to_json_string`).
 
-15. **Complete login** — `complete_login()`:
-    - `key_store.upsert_identity(...)` — stores OIDC identity locally.
-    - `POST {central}/v1/tokens` — mints a central token (the `--ttl` flag
-      sets the lifetime; default: never expires).
+15. **Complete login** — central stores the verified claim snapshot with the
+    new opaque token and returns both to the relay. The relay:
+    - `key_store.upsert_identity(...)` — stores only the central-verified
+      identity locally.
     - `agent_config::inject(...)` — writes the token into the agent config.
 
 ## Allowed signing algorithms
@@ -134,9 +141,8 @@ Run `oac-relay login` on the **host** against dev Keycloak:
 ```sh
 cargo build --release -p oac-relay
 ./docker/dev.sh up
-OAC_OIDC_CLIENT_SECRET="oac-relay-secret" \
-  ./target/release/oac-relay \
-    --config docker/dev/configs/relay-login-test.toml login
+./target/release/oac-relay \
+  --config docker/dev/configs/relay-login-test.toml login
 ```
 
 The containerized relay cannot do login (no host browser / loopback

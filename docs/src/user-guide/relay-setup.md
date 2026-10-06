@@ -30,7 +30,7 @@ dev_mode = false
 [oidc]
 issuer = "https://idp.example.com"
 client_id = "oac-relay"
-client_secret_env = "OAC_OIDC_CLIENT_SECRET"
+client_secret_env = ""
 redirect_uri = "http://127.0.0.1:0/callback"
 scopes = ["openid", "email", "profile", "groups"]
 
@@ -45,8 +45,8 @@ Key points:
 
 - `listen_addr` **must** be loopback (`127.0.0.1`) in production. The
   config validator rejects `0.0.0.0` unless `dev_mode = true`.
-- `client_secret_env` is the **name of an environment variable** holding
-  the OIDC client secret — never the secret itself.
+- `client_secret_env` is ignored by the relay and should be empty. The relay
+  is a public native client; the OIDC client secret exists only on central.
 - `redirect_uri` uses port `0` (any port); the relay binds a random
   loopback port at login time per RFC 8252.
 - `scopes` should include `groups` if you want group-based authorization
@@ -57,12 +57,6 @@ Key points:
   expand `~`).
 
 See [Configuration Reference](./configuration.md) for all fields.
-
-Set the OIDC client secret environment variable:
-
-```sh
-export OAC_OIDC_CLIENT_SECRET="your-oidc-client-secret"
-```
 
 ## Lifecycle
 
@@ -80,14 +74,17 @@ This runs the full OIDC authorization-code + PKCE flow:
    login page.
 4. After the employee logs in, the IdP redirects back to the loopback
    callback with an authorization code.
-5. The relay exchanges the code (with PKCE verifier) for tokens.
-6. Validates the ID token: alg pinned to {RS256, ES256}, verifies iss,
-   aud, exp, nonce, signature, and `at_hash`.
-7. Fetches userinfo (or falls back to ID-token claims).
-8. Upserts the user identity in the local SQLite DB.
-9. Requests a central-minted token via `POST /v1/tokens` (stores only the
-   SHA-256 hash at central; plaintext returned to the relay).
-10. Injects the base URL + token into the agent config file.
+5. The relay sends the one-time code, PKCE verifier, redirect URI, and nonce
+   to central's `POST /v1/tokens` over mTLS.
+6. Central uses its client secret to exchange the code and validates the ID
+   token: alg pinned to {RS256, ES256}, verifies iss, aud, exp, nonce,
+   signature, and `at_hash`.
+7. Central fetches userinfo (or falls back to validated ID-token claims) and
+   derives the identity and groups used for policy.
+8. Central mints an opaque token, stores only its SHA-256 hash, and returns
+   the plaintext token plus the verified identity once.
+9. Relay upserts that verified identity in local SQLite and injects the base
+   URL + token into the agent config file.
 
 The agent config is written to one of:
 

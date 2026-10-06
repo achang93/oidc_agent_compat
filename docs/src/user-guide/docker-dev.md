@@ -41,7 +41,7 @@ All users are in the `oac-dev` Keycloak realm:
 > The dev realm defines **no groups or roles** — the last-name column is
 > just profile data. Group-based policies cannot be exercised through real
 > OIDC logins in this stack; `dev.sh` performs admin operations directly
-> with a dev token (minted via `POST /v1/tokens` with the `oac-admins` group) instead.
+> with a token minted by central's dev-mode-only local `dev-token` command.
 
 Keycloak admin console: `http://localhost:8080/admin` (admin / admin).
 
@@ -78,9 +78,11 @@ docker compose -f docker/dev/docker-compose.yml run --rm goose session
 
 ## Manual requests
 
-`docker/dev.sh up` mints a dev token via `POST /v1/tokens` at central
-after the stack starts, and writes it to `/tmp/oac-dev-token`. Use it for
-manual curl:
+`docker/dev.sh up` executes central's hidden, dev-mode-only `dev-token`
+command inside the central container after the stack starts, then writes the
+result to `/tmp/oac-dev-token`. The public HTTP token endpoint never accepts
+caller-supplied identity claims. Central requires a valid bearer even in dev
+mode. Use the token for manual curl:
 
 ```sh
 # List models:
@@ -119,15 +121,16 @@ the host** against the dev Keycloak:
 # Build the relay:
 cargo build --release -p oac-relay
 
-# Run login:
-OAC_OIDC_CLIENT_SECRET="oac-relay-secret" \
-  ./target/release/oac-relay \
-    --config docker/dev/configs/relay-login-test.toml login
+# Run login (the relay needs no OIDC client secret):
+./target/release/oac-relay \
+  --config docker/dev/configs/relay-login-test.toml login
 ```
 
 A browser opens to the Keycloak login page. Sign in as a test user. The
-relay validates the ID token, requests a central-minted token via
-`POST /v1/tokens`, and injects it into `~/.oac/agent-env.sh`.
+relay passes the one-time authorization code and PKCE verifier to central via
+`POST /v1/tokens`. Central exchanges the code, validates the ID token and
+userinfo, then returns a central-minted token for injection into
+`~/.oac/agent-env.sh`.
 
 The login-test config uses `dev_mode = true`, a separate SQLite DB
 (`/tmp/oac-relay-login-test.db`), and listens on `127.0.0.1:8788` to
@@ -137,9 +140,10 @@ avoid port conflicts with the Docker relay on `:8787`.
 
 The dev central config enables the admin API with
 `admin_group = "oac-admins"`. The dev Keycloak realm defines no groups, so
-no real login can satisfy that check — instead, `dev.sh up` mints a dev
-token via `POST /v1/tokens` with the `oac-admins` group, then uses it as a
-bearer token for admin API calls to register the mock provider and its key.
+no real login can satisfy that check — instead, `dev.sh up` invokes the
+dev-mode-only `oac-central dev-token` command through container-local database
+access with the `oac-admins` group, then uses it as a bearer token for admin
+API calls to register the mock provider and its key.
 To exercise group-based admin access end-to-end, add groups and a group
 mapper to the realm first.
 
@@ -153,8 +157,9 @@ export OAC_API_KEY="<key from oac-relay login>"
 ./target/release/oac-central admin --key $OAC_API_KEY audit-query
 ```
 
-In the stock dev stack, `dev.sh` mints the dev token with the `oac-admins`
-group directly in the token record, so admin API calls succeed.
+In the stock dev stack, `dev.sh` uses the central container's local
+dev-mode-only command to mint the token with the `oac-admins` group, so admin
+API calls succeed without weakening the HTTP bootstrap endpoint.
 
 See [Admin API](./admin-api.md) for all endpoints.
 
