@@ -39,6 +39,19 @@ enum Command {
     Serve,
     /// Admin API operations (manage policies, devices, audit logs).
     Admin(AdminCli),
+    /// Mint an initial token directly from the database in dev mode only.
+    #[command(hide = true)]
+    DevToken {
+        /// Subject stored on the development token.
+        #[arg(long, default_value = "dev-user")]
+        subject: String,
+        /// Comma-separated development groups.
+        #[arg(long)]
+        groups: Option<String>,
+        /// Human-readable token label.
+        #[arg(long, default_value = "dev-bootstrap")]
+        label: String,
+    },
 }
 
 /// Admin CLI subcommands.
@@ -174,8 +187,66 @@ fn main() -> Result<()> {
         match cli.command.unwrap_or(Command::Serve) {
             Command::Serve => serve(config).await,
             Command::Admin(admin_cli) => admin(admin_cli).await,
+            Command::DevToken {
+                subject,
+                groups,
+                label,
+            } => mint_dev_token(&config, subject, groups, label).await,
         }
     })
+}
+
+/// Mints an initial development token through direct database access.
+async fn mint_dev_token(
+    config: &CentralConfig,
+    subject: String,
+    groups: Option<String>,
+    label: String,
+) -> Result<()> {
+    if !config.dev_mode {
+        return Err(oidc_agent_common::error::Error::Config(
+            "dev-token is disabled unless dev_mode = true".into(),
+        ));
+    }
+    if subject.trim().is_empty() {
+        return Err(oidc_agent_common::error::Error::Config(
+            "dev-token subject must not be empty".into(),
+        ));
+    }
+    if label.trim().is_empty() {
+        return Err(oidc_agent_common::error::Error::Config(
+            "dev-token label must not be empty".into(),
+        ));
+    }
+    let groups = groups
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|group| !group.is_empty())
+                .map(String::from)
+                .collect::<Vec<_>>()
+        })
+        .filter(|groups| !groups.is_empty())
+        .map(|groups| serde_json::to_string(&groups))
+        .transpose()
+        .map_err(|error| oidc_agent_common::error::Error::Internal(error.to_string()))?;
+    let db = db::setup(&config.database_url).await?;
+    let minted = oac_central::token_store::TokenStore::new(db)
+        .mint_token(&oac_central::token_store::MintRequest {
+            subject,
+            issuer: config.oidc.issuer.clone(),
+            email: None,
+            display_name: None,
+            groups,
+            identity_id: None,
+            label,
+            expires_at: None,
+            device_fingerprint: None,
+        })
+        .await?;
+    println!("{}", minted.plaintext.as_str());
+    Ok(())
 }
 
 /// Loads the central config from the given path.
@@ -533,4 +604,59 @@ async fn admin_response(resp: reqwest::Response) -> Result<String> {
         )));
     }
     Ok(body)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+
+    fn test_config(dev_mode: bool) -> CentralConfig {
+        CentralConfig {
+            listen_addr: "127.0.0.1:8443".parse().expect("address"),
+            database_url: "sqlite://unused.db".into(),
+            oidc: oidc_agent_common::config::OidcConfig {
+                issuer: "https://idp.example.com".into(),
+                client_id: "test".into(),
+                client_secret_env: "TEST_SECRET".into(),
+                redirect_uri: "http://127.0.0.1:0/callback".into(),
+                scopes: vec!["openid".into()],
+            },
+            mtls: oidc_agent_common::config::MtlsServerConfig {
+                ca_cert_path: "/ca.pem".into(),
+                server_cert_path: "/server.pem".into(),
+                server_key_path: "/server.key".into(),
+            },
+            admin: None,
+            pricing: None,
+            dev_mode,
+            rate_limit_requests: 60,
+            rate_limit_window_secs: 60,
+        }
+    }
+
+    #[tokio::test]
+    async fn dev_token_is_disabled_in_production_mode() {
+        let result = mint_dev_token(&test_config(false), "alice".into(), None, "test".into()).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .expect_err("production must reject dev token minting")
+                .to_string()
+                .contains("dev_mode")
+        );
+    }
+
+    #[tokio::test]
+    async fn dev_token_rejects_empty_identity_before_database_access() {
+        let result = mint_dev_token(&test_config(true), "  ".into(), None, "test".into()).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .expect_err("empty subject must be rejected")
+                .to_string()
+                .contains("subject")
+        );
+    }
 }

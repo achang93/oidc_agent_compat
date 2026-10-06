@@ -9,7 +9,8 @@
 //!
 //! - Loopback redirect URI (`http://127.0.0.1:{port}/callback`), RFC 8252.
 //! - PKCE S256, `state`, `nonce`.
-//! - ID-token validation with alg pin {RS256, ES256}.
+//! - Secure grant handoff to central for ID-token validation with alg pin
+//!   {RS256, ES256}.
 //! - The central token is never printed; it's auto-injected into the agent
 //!   config.
 
@@ -22,14 +23,11 @@ use oidc_agent_common::oidc;
 use crate::agent_config::{AgentConfig, inject};
 use crate::keystore::KeyStore;
 
-use oidc_agent_common::oidc::{
-    CustomClient, CustomIdTokenClaims, CustomProviderMetadata, CustomUserInfoClaims,
-    groups_to_json_string, union_groups_roles,
-};
-use openidconnect::core::{CoreJwsSigningAlgorithm, CoreResponseType};
+use oidc_agent_common::oidc::{CustomClient, CustomProviderMetadata};
+use openidconnect::core::CoreResponseType;
 use openidconnect::{
-    AuthenticationFlow, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce,
-    OAuth2TokenResponse, PkceCodeChallenge, RedirectUrl, Scope, SubjectIdentifier,
+    AuthenticationFlow, AuthorizationCode, ClientId, CsrfToken, IssuerUrl, Nonce,
+    PkceCodeChallenge, RedirectUrl, Scope,
 };
 use serde::{Deserialize, Serialize};
 
@@ -98,24 +96,16 @@ pub struct LoginResult {
 }
 
 /// Request body for `POST /v1/tokens` (central token mint).
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct MintTokenRequest {
-    /// The user subject (from the IdP).
-    subject: String,
-    /// The OIDC issuer.
-    issuer: String,
-    /// The user email, if known.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    email: Option<String>,
-    /// The user display name, if known.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    display_name: Option<String>,
-    /// The group/role memberships (JSON array string), if known.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    groups: Option<String>,
-    /// The relay-side identity database ID, if known.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    identity_id: Option<String>,
+    /// One-time OIDC authorization code.
+    authorization_code: String,
+    /// PKCE verifier paired with the S256 challenge.
+    pkce_verifier: String,
+    /// Exact loopback redirect URI used by the authorization request.
+    redirect_uri: String,
+    /// OIDC nonce generated for the authorization request.
+    nonce: String,
     /// Human-readable label.
     label: String,
     /// Requested token lifetime in seconds. `None` = never expires.
@@ -134,38 +124,47 @@ struct MintTokenResponse {
     /// When the token expires (RFC 3339), or `null` for never.
     #[allow(dead_code)]
     expires_at: Option<String>,
+    /// The OIDC issuer validated by central.
+    issuer: String,
+    /// The subject validated by central.
+    subject: String,
+    /// The email validated by central, if present.
+    email: Option<String>,
+    /// The display name validated by central, if present.
+    display_name: Option<String>,
+    /// The group and role claims validated by central, if present.
+    groups: Option<String>,
 }
 
-/// The verified OIDC identity claims passed to [`complete_login`].
+/// The one-time authorization-code grant passed to [`complete_login`].
 ///
-/// Grouping these into a struct keeps the function signature within clippy's
-/// argument-count threshold and makes call sites more readable.
-#[derive(Debug)]
-pub struct IdentityClaims<'a> {
-    /// The OIDC issuer.
-    pub issuer: &'a str,
-    /// The user subject (from the IdP).
-    pub subject: &'a str,
-    /// The user email, if known.
-    pub email: Option<&'a str>,
-    /// The user display name, if known.
-    pub display_name: Option<&'a str>,
-    /// The group/role memberships (JSON array string), if known.
-    pub groups: Option<&'a str>,
+/// This type intentionally does not implement `Debug`: the authorization
+/// code and PKCE verifier are short-lived secrets and must not reach logs.
+pub struct AuthorizationCodeGrant<'a> {
+    /// The authorization code returned to the loopback callback.
+    pub authorization_code: &'a str,
+    /// The PKCE verifier paired with the authorization request.
+    pub pkce_verifier: &'a str,
+    /// The exact loopback redirect URI used for the authorization request.
+    pub redirect_uri: &'a str,
+    /// The OIDC nonce generated for the authorization request.
+    pub nonce: &'a str,
 }
 
-/// Orchestrates the login flow after OIDC authentication has completed.
+/// Completes login by asking central to exchange and validate the OIDC grant.
 ///
 /// This is called by the `login` subcommand after the OIDC callback has
-/// returned the user's identity claims. It:
-/// 1. Upserts the identity in the local database (for login convenience).
-/// 2. Calls the central proxy's `POST /v1/tokens` to mint a central token.
+/// returned the one-time authorization code. It:
+/// 1. Calls central's `POST /v1/tokens`, which exchanges the code and validates
+///    the ID token and userinfo response.
+/// 2. Upserts only the identity returned by central in the local database.
 /// 3. Injects the base URL + central token into the agent's config.
 ///
 /// # Security
 ///
-/// The plaintext central token is passed to `inject` and then dropped. It
-/// is never printed or persisted by the relay.
+/// The relay never receives the OIDC client secret and never decides which
+/// claims are trusted for central authorization. The one-time code and PKCE
+/// verifier are sent only to central over the configured mTLS connection.
 ///
 /// # Errors
 ///
@@ -175,29 +174,16 @@ pub async fn complete_login(
     key_store: &KeyStore,
     config: &RelayConfig,
     client: &reqwest::Client,
-    identity: IdentityClaims<'_>,
+    grant: AuthorizationCodeGrant<'_>,
     ttl_seconds: Option<i64>,
 ) -> Result<LoginResult> {
-    // 1. Upsert the identity (local DB — for login convenience so the user
-    //    does not have to re-run the full OIDC flow every time).
-    let stored_identity = key_store
-        .upsert_identity(
-            identity.issuer,
-            identity.subject,
-            identity.email,
-            identity.display_name,
-            identity.groups,
-        )
-        .await?;
-
-    // 2. Mint a central token via POST /v1/tokens.
+    // 1. Exchange and validate the one-time grant at central, then mint a
+    // central token for the identity central derived from the IdP response.
     let mint_request = MintTokenRequest {
-        subject: identity.subject.to_string(),
-        issuer: identity.issuer.to_string(),
-        email: identity.email.map(String::from),
-        display_name: identity.display_name.map(String::from),
-        groups: identity.groups.map(String::from),
-        identity_id: Some(stored_identity.id.clone()),
+        authorization_code: grant.authorization_code.to_string(),
+        pkce_verifier: grant.pkce_verifier.to_string(),
+        redirect_uri: grant.redirect_uri.to_string(),
+        nonce: grant.nonce.to_string(),
         label: "default".to_string(),
         ttl_seconds,
     };
@@ -231,6 +217,17 @@ pub async fn complete_login(
         .await
         .map_err(|e| Error::http(format!("failed to parse central token response: {e}")))?;
 
+    // 2. Persist only the identity that central verified.
+    key_store
+        .upsert_identity(
+            &minted.issuer,
+            &minted.subject,
+            minted.email.as_deref(),
+            minted.display_name.as_deref(),
+            minted.groups.as_deref(),
+        )
+        .await?;
+
     // 3. Inject the central token into the agent config.
     let base_url = format!("http://{}/v1", config.listen_addr);
     let agent_config = AgentConfig {
@@ -240,8 +237,8 @@ pub async fn complete_login(
     let injection = inject(&agent_config)?;
 
     Ok(LoginResult {
-        subject: identity.subject.to_string(),
-        email: identity.email.map(String::from),
+        subject: minted.subject,
+        email: minted.email,
         injection,
     })
 }
@@ -251,23 +248,22 @@ pub async fn complete_login(
 /// # Flow
 ///
 /// 1. Validate the loopback redirect URI (RFC 8252).
-/// 2. Resolve the client secret from the environment.
-/// 3. Discover the IdP's metadata via the issuer URL.
-/// 4. Generate PKCE (S256), `state`, and `nonce`.
-/// 5. Bind a one-shot loopback HTTP listener (random port).
-/// 6. Build the authorization URL and open it in the browser.
-/// 7. Receive the callback, verify `state`, exchange the code for tokens.
-/// 8. Validate the ID token (alg pin {RS256, ES256}, iss, aud, exp, nonce,
-///    signature via JWKS).
-/// 9. Fetch userinfo (email, name, groups), falling back to ID-token claims.
-/// 10. Call [`complete_login`] to persist + mint central token + inject.
+/// 2. Discover the IdP's metadata via the issuer URL.
+/// 3. Generate PKCE (S256), `state`, and `nonce`.
+/// 4. Bind a one-shot loopback HTTP listener (random port).
+/// 5. Build the authorization URL and open it in the browser.
+/// 6. Receive the callback and verify `state`.
+/// 7. Send the one-time code and PKCE verifier to central over mTLS.
+/// 8. Central exchanges the code, validates the ID token and userinfo, and
+///    mints the opaque agent token.
+/// 9. Persist the central-verified identity and inject the agent token.
 ///
 /// # Security
 ///
 /// - PKCE S256 (RFC 7636, RFC 9700 §2.1.1).
-/// - `state` (CSRF) and `nonce` (replay) verified.
-/// - ID-token signing algorithm pinned to {RS256, ES256}; `none` and HS*
-///   rejected (OIDC Core §2, repo security research).
+/// - `state` (CSRF) is verified by the relay; central verifies `nonce` and
+///   performs all ID-token validation.
+/// - The native relay never receives the OIDC client secret.
 /// - Loopback redirect only (RFC 8252 §7.3).
 /// - HTTP client never follows redirects (SSRF prevention).
 /// - The central token is never printed; it's auto-injected into the agent
@@ -284,20 +280,17 @@ pub async fn run_login(
     // 1. Validate the redirect URI is a loopback http URL.
     oidc::validate_loopback_redirect(&config.oidc.redirect_uri)?;
 
-    // 2. Resolve the client secret from the environment.
-    let client_secret = oidc::resolve_client_secret(&config.oidc)?;
-
-    // 3. Build the HTTP client (no redirects, rustls, timeouts).
+    // 2. Build the HTTP client (no redirects, rustls, timeouts).
     let http_client = oidc::build_http_client()?;
 
-    // 4. Discover the IdP metadata.
+    // 3. Discover the IdP metadata needed to build the authorization URL.
     let issuer_url = IssuerUrl::new(config.oidc.issuer.clone())
         .map_err(|e| Error::oidc(format!("invalid issuer URL: {e}")))?;
     let provider_metadata = CustomProviderMetadata::discover_async(issuer_url, &http_client)
         .await
         .map_err(|e| Error::oidc(format!("OIDC discovery failed: {e}")))?;
 
-    // 5. Bind a one-shot loopback listener to get a real port (RFC 8252 §7.3).
+    // 4. Bind a one-shot loopback listener to get a real port (RFC 8252 §7.3).
     //    The config redirect_uri may use port 0 (any port); we substitute the
     //    actual bound port. The IdP MUST allow any loopback port.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -310,19 +303,21 @@ pub async fn run_login(
     let redirect_uri_str = format!("http://127.0.0.1:{callback_port}/callback");
     let redirect_uri = RedirectUrl::new(redirect_uri_str)
         .map_err(|e| Error::oidc(format!("invalid redirect URL: {e}")))?;
+    let bootstrap_redirect_uri = redirect_uri.to_string();
 
-    // 6. Build the OIDC client.
+    // 5. Build the public native OIDC client. Central alone holds the secret
+    // and performs the eventual token exchange.
     let client = CustomClient::from_provider_metadata(
         provider_metadata,
         ClientId::new(config.oidc.client_id.clone()),
-        Some(ClientSecret::new(client_secret)),
+        None,
     )
     .set_redirect_uri(redirect_uri);
 
-    // 7. Generate PKCE (S256), state, and nonce.
+    // 6. Generate PKCE (S256), state, and nonce.
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
-    // 8. Build the authorization URL.
+    // 7. Build the authorization URL.
     let (authorize_url, csrf_state, nonce) = client
         .authorize_url(
             AuthenticationFlow::<CoreResponseType>::AuthorizationCode,
@@ -342,171 +337,35 @@ pub async fn run_login(
         .set_pkce_challenge(pkce_challenge)
         .url();
 
-    // 9. Open the browser (best effort); always print the URL as fallback.
+    // 8. Open the browser (best effort); always print the URL as fallback.
     let url_string = authorize_url.to_string();
     println!("Open this URL in your browser to log in:\n{url_string}\n");
     open_browser(&url_string);
 
-    // 10. Wait for the callback (with timeout).
+    // 9. Wait for the callback (with timeout).
     let (code, state) = wait_for_callback(listener, CALLBACK_TIMEOUT).await?;
 
-    // 11. Verify state (CSRF defense).
+    // 10. Verify state (CSRF defense).
     if state.secret() != csrf_state.secret() {
         return Err(Error::oidc(
             "state mismatch — possible CSRF attack or stale callback",
         ));
     }
 
-    // 12. Exchange the code for tokens (with PKCE verifier).
-    let token_response = client
-        .exchange_code(code)
-        .map_err(|e| Error::oidc(format!("prepare token exchange: {e}")))?
-        .set_pkce_verifier(pkce_verifier)
-        .request_async(&http_client)
-        .await
-        .map_err(|e| Error::oidc(format!("token exchange failed: {e}")))?;
-
-    // 13. Extract and validate the ID token.
-    let id_token = token_response
-        .extra_fields()
-        .id_token()
-        .ok_or_else(|| Error::oidc("IdP did not return an ID token"))?;
-
-    // 13a. Alg pin: reject anything other than RS256/ES256 BEFORE verifying
-    //     the signature (defense in depth; the crate's verifier accepts
-    //     whatever alg the JWKS advertises).
-    let signing_alg = id_token
-        .signing_alg()
-        .map_err(|e| Error::oidc(format!("ID token has no signing algorithm: {e}")))?;
-    if !is_allowed_alg(signing_alg) {
-        return Err(Error::oidc(
-            "ID token signed with disallowed algorithm; only RS256/ES256 are accepted",
-        ));
-    }
-
-    // 13b. Verify the ID token claims (iss, aud, exp, nonce, signature).
-    let id_token_claims: &CustomIdTokenClaims = id_token
-        .claims(&client.id_token_verifier(), &nonce)
-        .map_err(|e| Error::oidc(format!("ID token validation failed: {e}")))?;
-
-    // 13c. Verify the at_hash claim (OIDC Core §3.1.3.7 step 3).
-    // If the IdP includes an at_hash in the ID token, we verify it against
-    // the access token to prevent token substitution attacks.
-    if let Some(expected_at_hash) = id_token_claims.access_token_hash() {
-        let id_token_verifier = client.id_token_verifier();
-        let signing_key = id_token
-            .signing_key(&id_token_verifier)
-            .map_err(|e| Error::oidc(format!("ID token signing key lookup failed: {e}")))?;
-        let actual_at_hash = openidconnect::AccessTokenHash::from_token(
-            token_response.access_token(),
-            signing_alg,
-            signing_key,
-        )
-        .map_err(|e| Error::oidc(format!("at_hash computation failed: {e}")))?;
-        if actual_at_hash != *expected_at_hash {
-            return Err(Error::oidc(
-                "at_hash mismatch — access token may have been substituted",
-            ));
-        }
-        tracing::debug!("at_hash verified successfully");
-    }
-
-    // 14. Fetch userinfo (email, name, groups); fall back to ID-token claims.
-    let expected_subject = SubjectIdentifier::new(id_token_claims.subject().to_string());
-    let (subject, email, display_name, groups) = match client.user_info(
-        token_response.access_token().clone(),
-        Some(expected_subject),
-    ) {
-        Ok(userinfo_request) => match userinfo_request.request_async(&http_client).await {
-            Ok(userinfo) => {
-                let userinfo: CustomUserInfoClaims = userinfo;
-                let subject = userinfo.subject().to_string();
-                let email = userinfo.email().map(|e| e.as_str().to_string());
-                let display_name = userinfo
-                    .name()
-                    .and_then(|n| n.get(None))
-                    .map(|n| n.as_str().to_string())
-                    .or_else(|| {
-                        userinfo
-                            .preferred_username()
-                            .map(|u| u.as_str().to_string())
-                    });
-                // Extract groups + roles from the additional claims and union
-                // them into a single JSON array string.
-                let groups = {
-                    let combined = union_groups_roles(userinfo.additional_claims());
-                    groups_to_json_string(&combined)
-                };
-                (subject, email, display_name, groups)
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "userinfo request failed, falling back to ID-token claims");
-                claims_from_id_token(id_token_claims)
-            }
-        },
-        Err(e) => {
-            tracing::warn!(error = %e, "userinfo endpoint unavailable, falling back to ID-token claims");
-            claims_from_id_token(id_token_claims)
-        }
-    };
-
-    // 15. Persist + mint central token + inject.
+    // 11. Let central exchange the code, validate identity, mint, and return
+    // the verified identity for local convenience storage.
     let ttl_seconds = match ttl {
         Some(t) => parse_ttl_to_seconds(t)?,
         None => None,
     };
     let central_client = crate::proxy::forward::build_client(config)?;
-    let identity = IdentityClaims {
-        issuer: &config.oidc.issuer,
-        subject: &subject,
-        email: email.as_deref(),
-        display_name: display_name.as_deref(),
-        groups: groups.as_deref(),
+    let grant = AuthorizationCodeGrant {
+        authorization_code: code.secret(),
+        pkce_verifier: pkce_verifier.secret(),
+        redirect_uri: &bootstrap_redirect_uri,
+        nonce: nonce.secret(),
     };
-    complete_login(key_store, config, &central_client, identity, ttl_seconds).await
-}
-
-/// Returns `true` if the signing algorithm is RS256 or ES256.
-///
-/// # Security
-///
-/// Rejects `none` (no signature) and all HS* (HMAC) algorithms, which would
-/// be insecure for ID-token validation (OIDC Core §2). This is a defense in
-/// depth on top of the crate's verifier, which accepts whatever alg the
-/// JWKS advertises.
-fn is_allowed_alg(alg: &CoreJwsSigningAlgorithm) -> bool {
-    matches!(
-        alg,
-        CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256 // RS256
-            | CoreJwsSigningAlgorithm::EcdsaP256Sha256 // ES256
-    )
-}
-
-/// Extracts identity fields from the ID-token claims (fallback when userinfo
-/// is unavailable).
-///
-/// Group and role claims are extracted from the additional claims (via
-/// [`CustomAdditionalClaims`]) and unioned into a single JSON array string
-/// for storage in the `identities.groups` column.
-fn claims_from_id_token(
-    claims: &CustomIdTokenClaims,
-) -> (String, Option<String>, Option<String>, Option<String>) {
-    let subject = claims.subject().to_string();
-    let email = claims.email().map(|e| e.as_str().to_string());
-    let email_verified = claims.email_verified().unwrap_or(false);
-    // Prefer the userinfo-style name; fall back to preferred_username.
-    let display_name = claims
-        .name()
-        .and_then(|n| n.get(None))
-        .map(|n| n.as_str().to_string())
-        .or_else(|| claims.preferred_username().map(|u| u.as_str().to_string()));
-    // Extract groups + roles from the additional claims and union them.
-    let groups = {
-        let combined = union_groups_roles(claims.additional_claims());
-        groups_to_json_string(&combined)
-    };
-    let _ = email_verified;
-    (subject, email, display_name, groups)
+    complete_login(key_store, config, &central_client, grant, ttl_seconds).await
 }
 
 /// Waits for a single OIDC callback on the loopback listener.
@@ -699,12 +558,11 @@ mod tests {
             &store,
             &config,
             &client,
-            IdentityClaims {
-                issuer: "https://idp.example.com",
-                subject: "user123",
-                email: Some("user@example.com"),
-                display_name: Some("Test User"),
-                groups: None,
+            AuthorizationCodeGrant {
+                authorization_code: "test-code",
+                pkce_verifier: "test-verifier",
+                redirect_uri: "http://127.0.0.1:7777/callback",
+                nonce: "test-nonce",
             },
             None,
         )
@@ -735,12 +593,11 @@ mod tests {
             &store,
             &config,
             &client,
-            IdentityClaims {
-                issuer: "https://idp.example.com",
-                subject: "ttl-user",
-                email: None,
-                display_name: None,
-                groups: None,
+            AuthorizationCodeGrant {
+                authorization_code: "test-code",
+                pkce_verifier: "test-verifier",
+                redirect_uri: "http://127.0.0.1:7777/callback",
+                nonce: "test-nonce",
             },
             Some(3600),
         )
@@ -769,12 +626,11 @@ mod tests {
             &store,
             &config,
             &client,
-            IdentityClaims {
-                issuer: "https://idp.example.com",
-                subject: "user123",
-                email: None,
-                display_name: None,
-                groups: None,
+            AuthorizationCodeGrant {
+                authorization_code: "test-code",
+                pkce_verifier: "test-verifier",
+                redirect_uri: "http://127.0.0.1:7777/callback",
+                nonce: "test-nonce",
             },
             None,
         )
@@ -786,12 +642,11 @@ mod tests {
             &store,
             &config,
             &client,
-            IdentityClaims {
-                issuer: "https://idp.example.com",
-                subject: "user123",
-                email: None,
-                display_name: None,
-                groups: None,
+            AuthorizationCodeGrant {
+                authorization_code: "test-code",
+                pkce_verifier: "test-verifier",
+                redirect_uri: "http://127.0.0.1:7777/callback",
+                nonce: "test-nonce",
             },
             None,
         )
@@ -818,12 +673,11 @@ mod tests {
             &store,
             &config,
             &client,
-            IdentityClaims {
-                issuer: "https://idp.example.com",
-                subject: "user-groups",
-                email: Some("user@example.com"),
-                display_name: None,
-                groups: Some(groups_json),
+            AuthorizationCodeGrant {
+                authorization_code: "test-code",
+                pkce_verifier: "test-verifier",
+                redirect_uri: "http://127.0.0.1:7777/callback",
+                nonce: "test-nonce",
             },
             None,
         )
@@ -843,12 +697,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_login_no_longer_returns_placeholder() {
-        // run_login is now implemented. Against a fake issuer (and without
-        // the client secret env var set), it must fail with a real error —
-        // NOT the old "not yet implemented" placeholder. We don't set the
-        // secret env var (set_var is unsafe in edition 2024 and the crate
-        // forbids unsafe), so it fails at the secret check; that's still a
-        // valid non-placeholder error.
+        // Against a fake issuer, run_login must fail with a real discovery
+        // error rather than the old implementation placeholder.
         let store = setup_test_db().await;
         let config = test_config();
         let err = run_login(&config, &store, None).await.unwrap_err();
@@ -857,68 +707,9 @@ mod tests {
             !msg.contains("not yet implemented"),
             "run_login must no longer return the placeholder error: {msg}"
         );
-        // It should fail at either the secret check or discovery.
         assert!(
-            msg.contains("client secret") || msg.contains("discovery") || msg.contains("issuer"),
-            "expected a secret/discovery/issuer error, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn is_allowed_alg_accepts_rs256_and_es256() {
-        assert!(is_allowed_alg(
-            &CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256
-        ));
-        assert!(is_allowed_alg(&CoreJwsSigningAlgorithm::EcdsaP256Sha256));
-    }
-
-    #[test]
-    fn is_allowed_alg_rejects_none_and_hmac() {
-        assert!(!is_allowed_alg(&CoreJwsSigningAlgorithm::None));
-        assert!(!is_allowed_alg(&CoreJwsSigningAlgorithm::HmacSha256));
-        assert!(!is_allowed_alg(&CoreJwsSigningAlgorithm::HmacSha512));
-        // Other RSA/ECDSA variants are also rejected (only RS256/ES256 allowed).
-        assert!(!is_allowed_alg(
-            &CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha384
-        ));
-        assert!(!is_allowed_alg(&CoreJwsSigningAlgorithm::EcdsaP384Sha384));
-    }
-
-    #[test]
-    fn claims_from_id_token_extracts_groups_and_roles() {
-        // Build a CustomIdTokenClaims from a JSON string containing groups + roles.
-        let json = r#"{
-            "iss": "https://idp.example.com",
-            "sub": "user-grp",
-            "aud": "test",
-            "exp": 9999999999,
-            "iat": 1000000000,
-            "groups": ["engineering", "ai-users"],
-            "roles": ["admin", "ai-users"]
-        }"#;
-        let claims: CustomIdTokenClaims = serde_json::from_str(json).expect("parse claims");
-        let (subject, _email, _display, groups) = claims_from_id_token(&claims);
-        assert_eq!(subject, "user-grp");
-        let groups = groups.expect("groups must be extracted");
-        let parsed: Vec<String> = serde_json::from_str(&groups).expect("parse groups json");
-        // Union of groups + roles, deduplicated and sorted.
-        assert_eq!(parsed, vec!["admin", "ai-users", "engineering"]);
-    }
-
-    #[test]
-    fn claims_from_id_token_no_groups_returns_none() {
-        let json = r#"{
-            "iss": "https://idp.example.com",
-            "sub": "user-nogrp",
-            "aud": "test",
-            "exp": 9999999999,
-            "iat": 1000000000
-        }"#;
-        let claims: CustomIdTokenClaims = serde_json::from_str(json).expect("parse claims");
-        let (_subject, _email, _display, groups) = claims_from_id_token(&claims);
-        assert!(
-            groups.is_none(),
-            "groups must be None when no claims present"
+            msg.contains("discovery") || msg.contains("issuer"),
+            "expected a discovery/issuer error, got: {msg}"
         );
     }
 
@@ -1134,49 +925,6 @@ mod tests {
         );
     }
 
-    // --- ID-token claim extraction fallbacks ---
-
-    #[test]
-    fn claims_from_id_token_falls_back_to_preferred_username() {
-        let json = r#"{
-            "iss": "https://idp.example.com",
-            "sub": "user-pref",
-            "aud": "test",
-            "exp": 9999999999,
-            "iat": 1000000000,
-            "preferred_username": "alice"
-        }"#;
-        let claims: CustomIdTokenClaims = serde_json::from_str(json).expect("parse claims");
-        let (_subject, _email, display, _groups) = claims_from_id_token(&claims);
-        assert_eq!(
-            display.as_deref(),
-            Some("alice"),
-            "preferred_username must back the display name"
-        );
-    }
-
-    #[test]
-    fn claims_from_id_token_extracts_name_and_email() {
-        let json = r#"{
-            "iss": "https://idp.example.com",
-            "sub": "user-name",
-            "aud": "test",
-            "exp": 9999999999,
-            "iat": 1000000000,
-            "email": "user@example.com",
-            "name": "Alice Doe"
-        }"#;
-        let claims: CustomIdTokenClaims = serde_json::from_str(json).expect("parse claims");
-        let (subject, email, display, _groups) = claims_from_id_token(&claims);
-        assert_eq!(subject, "user-name");
-        assert_eq!(email.as_deref(), Some("user@example.com"));
-        assert_eq!(
-            display.as_deref(),
-            Some("Alice Doe"),
-            "the name claim must be preferred when present"
-        );
-    }
-
     /// Verifies that `complete_login` persists the display name. Requires a
     /// live central server.
     #[tokio::test]
@@ -1189,12 +937,11 @@ mod tests {
             &store,
             &config,
             &client,
-            IdentityClaims {
-                issuer: "https://idp.example.com",
-                subject: "user-display",
-                email: None,
-                display_name: Some("Alice Doe"),
-                groups: None,
+            AuthorizationCodeGrant {
+                authorization_code: "test-code",
+                pkce_verifier: "test-verifier",
+                redirect_uri: "http://127.0.0.1:7777/callback",
+                nonce: "test-nonce",
             },
             None,
         )

@@ -21,6 +21,7 @@ pub mod device_store;
 pub mod entity;
 pub mod mcp;
 pub mod migration;
+pub mod oidc_bootstrap;
 pub mod optimizer;
 pub mod policy;
 pub mod pricing;

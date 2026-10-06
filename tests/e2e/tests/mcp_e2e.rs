@@ -187,6 +187,9 @@ async fn setup_mcp_system() -> (
         price_table: oac_central::pricing::PriceTable::empty(),
         mcp_manager,
         token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
+        bootstrap_verifier: std::sync::Arc::new(
+            oac_central::oidc_bootstrap::UnavailableBootstrapVerifier,
+        ),
     };
     let central_app = central_proxy::router(central_state);
     let central_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -462,6 +465,9 @@ async fn setup_hub_system() -> (
         price_table: oac_central::pricing::PriceTable::empty(),
         mcp_manager,
         token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
+        bootstrap_verifier: std::sync::Arc::new(
+            oac_central::oidc_bootstrap::UnavailableBootstrapVerifier,
+        ),
     };
     let central_app = central_proxy::router(central_state);
     let central_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -624,10 +630,9 @@ async fn denied_tool_returns_403_and_is_denied_in_audit() {
 }
 
 #[tokio::test]
-async fn relay_dev_mode_allows_mcp_without_auth() {
-    // In dev_mode, the relay skips auth and forwards to central, which also
-    // allows requests without auth in dev_mode. The request is forwarded to
-    // the upstream MCP server.
+async fn relay_dev_mode_mcp_still_requires_central_auth() {
+    // The relay skips its presence check in dev mode, but central must still
+    // reject an MCP request without a bearer token.
     let (relay_addr, client, _key, _server, _audit, _key_store) = setup_mcp_system().await;
     let url = format!("http://{relay_addr}/mcp/fs");
     let resp = client
@@ -637,15 +642,7 @@ async fn relay_dev_mode_allows_mcp_without_auth() {
         .send()
         .await
         .expect("request");
-    // Central in dev_mode allows no-auth, but the MCP policy still applies.
-    // Without a token, central has no identity, so it can't match a policy.
-    // The response is either 200 (if central allows no-auth no-policy) or
-    // 403 (if policy is checked). In dev_mode, central allows it through.
-    assert_ne!(
-        resp.status(),
-        reqwest::StatusCode::UNAUTHORIZED,
-        "dev_mode relay must not reject for missing auth"
-    );
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -964,9 +961,9 @@ async fn hub_tools_call_rejects_unprefixed_tool_name() {
 }
 
 #[tokio::test]
-async fn hub_dev_mode_allows_without_auth() {
-    // In dev_mode, the relay skips auth. Central also allows no-auth in
-    // dev_mode. The hub request is forwarded without a 401.
+async fn hub_dev_mode_still_requires_central_auth() {
+    // The relay skips its presence check in dev mode, but central still
+    // authenticates the combined MCP hub endpoint.
     let (relay_addr, client, _key, _central_db) = setup_hub_system().await;
     let url = format!("http://{relay_addr}/mcp");
     let resp = client
@@ -976,9 +973,5 @@ async fn hub_dev_mode_allows_without_auth() {
         .send()
         .await
         .expect("request");
-    assert_ne!(
-        resp.status(),
-        reqwest::StatusCode::UNAUTHORIZED,
-        "dev_mode relay must not reject for missing auth"
-    );
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 }

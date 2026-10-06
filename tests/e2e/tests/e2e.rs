@@ -146,6 +146,9 @@ async fn setup_full_system() -> (
             Zeroizing::new([7_u8; 32]),
         ),
         token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
+        bootstrap_verifier: std::sync::Arc::new(
+            oac_central::oidc_bootstrap::UnavailableBootstrapVerifier,
+        ),
     };
     let central_app = central_proxy::router(central_state);
     let central_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -322,15 +325,14 @@ async fn e2e_post_embeddings_through_full_chain() {
 }
 
 #[tokio::test]
-async fn e2e_dev_mode_allows_request_without_key() {
-    // In dev_mode, both the relay and central allow requests without an
-    // Authorization header (for manual curl testing). The relay is a dumb
-    // forwarder; central is the sole verification authority. In production,
-    // both enforce auth.
+async fn e2e_dev_mode_rejects_request_without_key() {
+    // The relay skips its presence check in dev mode, but central remains the
+    // sole verification authority and must reject a missing bearer in every
+    // mode.
     let (addr, client, _, _, _) = setup_full_system().await;
     let url = format!("http://127.0.0.1:{}/v1/models", addr.port());
     let resp = client.get(&url).send().await.expect("request");
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

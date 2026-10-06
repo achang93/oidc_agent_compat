@@ -84,8 +84,8 @@ pub async fn permissions_middleware(
     let identity = match identity {
         Some(id) => id,
         None => {
-            // No identity — auth middleware should have already rejected
-            // this (unless dev_mode). Allow through; auth handles it.
+            // No identity — the outer auth middleware rejects this in every
+            // mode. Allow it to continue outward so auth returns the 401.
             return Ok(next.run(request).await);
         }
     };
@@ -409,6 +409,9 @@ mod tests {
             price_table: crate::pricing::PriceTable::empty(),
             mcp_manager: crate::mcp::McpManager::new(mcp_db, Zeroizing::new([7_u8; 32])),
             token_store: crate::token_store::TokenStore::new(db),
+            bootstrap_verifier: std::sync::Arc::new(
+                crate::oidc_bootstrap::UnavailableBootstrapVerifier,
+            ),
         }
     }
 

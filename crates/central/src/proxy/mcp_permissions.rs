@@ -378,6 +378,9 @@ mod tests {
             price_table: crate::pricing::PriceTable::empty(),
             mcp_manager: crate::mcp::McpManager::new(mcp_db, Zeroizing::new([7_u8; 32])),
             token_store: crate::token_store::TokenStore::new(db),
+            bootstrap_verifier: std::sync::Arc::new(
+                crate::oidc_bootstrap::UnavailableBootstrapVerifier,
+            ),
         }
     }
 

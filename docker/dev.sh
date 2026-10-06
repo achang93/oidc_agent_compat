@@ -53,14 +53,14 @@ cmd_up() {
     wait_for "http://localhost:8443/healthz" 30 "Central proxy"
     wait_for "http://127.0.0.1:8787/healthz" 30 "Relay"
 
-    info "Minting a dev token at central..."
-    # Mint a dev token via the central token API (POST /v1/tokens).
-    # The relay is a dumb forwarder — it does not mint keys locally.
-    # This token is used for Goose and for admin API calls in the dev stack.
-    DEV_TOKEN=$(curl -sfS -X POST http://localhost:8443/v1/tokens \
-        -H 'Content-Type: application/json' \
-        -d '{"subject":"dev-alice","issuer":"dev","email":"alice@example.com","groups":["oac-admins"],"label":"dev-stack","ttl_seconds":null}' \
-        | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+    info "Minting a dev token through direct central database access..."
+    # Interactive login bootstraps through OIDC. The non-interactive dev stack
+    # instead uses a dev-mode-only CLI inside the central container; the public
+    # HTTP token endpoint never accepts caller-supplied identity claims.
+    DEV_TOKEN=$(docker compose -f "$COMPOSE_FILE" exec -T central \
+        oac-central --config /config/central.toml dev-token \
+        --subject dev-alice --groups oac-admins --label dev-stack \
+        | tail -n 1)
     ok "Dev token minted"
 
     info "Registering the mock provider and test key..."
@@ -129,8 +129,8 @@ cmd_goose() {
     echo "  docker compose -f docker/dev/docker-compose.yml run --rm goose session"
     echo ""
     echo "  # Goose is configured to use the relay at http://relay:8787"
-    echo "  # with a central-minted dev token and model 'mock-gpt-4'.
-  # The dev token is minted by 'dev.sh up' via POST /v1/tokens at central."
+    echo "  # with a central-minted dev token and model 'mock-gpt-4'."
+    echo "  # 'dev.sh up' mints it through central's dev-mode-only local CLI."
     echo ""
     echo "  # To use a different key, edit the OPENAI_API_KEY env var in"
     echo "  # docker/dev/docker-compose.yml under the 'goose' service."
@@ -156,7 +156,7 @@ cmd_test() {
     fi
     DEV_TOKEN=$(cat /tmp/oac-dev-token)
 
-    # The dev token is minted by 'dev.sh up' via POST /v1/tokens at central.
+    # The dev token is minted by central's dev-mode-only local CLI.
     # The tests below exercise the full relay → central → backend chain
     # with that token, plus the security negative paths (401/400).
 
@@ -296,8 +296,8 @@ cmd_test() {
     echo ""
     ok "All tests passed (infrastructure + full chain + SSE)!"
     echo ""
-    info "The dev token was minted by 'dev.sh up' via POST /v1/tokens at"
-    info "central. Use it for manual curl, e.g.:"
+    info "The dev token was minted by 'dev.sh up' through central's local"
+    info "dev-mode-only CLI. Use it for manual curl, e.g.:"
     echo "  curl -H \"Authorization: Bearer $DEV_TOKEN\" http://127.0.0.1:8787/v1/models"
 }
 

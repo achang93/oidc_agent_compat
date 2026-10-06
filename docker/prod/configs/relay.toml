@@ -15,7 +15,7 @@ dev_mode = false
 [oidc]
 issuer = "https://idp.example.com/realms/your-realm"
 client_id = "oac-relay"
-client_secret_env = "OAC_OIDC_CLIENT_SECRET"
+client_secret_env = ""
 # Loopback redirect, any port (RFC 8252). The relay picks a free port at login.
 redirect_uri = "http://127.0.0.1:0/callback"
 # The "groups" scope is REQUIRED for group-based policy enforcement and

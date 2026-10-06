@@ -61,6 +61,8 @@ pub struct AppState {
     pub mcp_manager: crate::mcp::McpManager,
     /// The central token store (zero-trust opaque tokens).
     pub token_store: crate::token_store::TokenStore,
+    /// Exchanges OIDC authorization codes and returns centrally verified identities.
+    pub bootstrap_verifier: Arc<dyn crate::oidc_bootstrap::BootstrapIdentityVerifier>,
 }
 
 impl AppState {
@@ -194,6 +196,17 @@ pub async fn serve(
     encryption_key: zeroize::Zeroizing<[u8; 32]>,
     audit: AuditLogger,
 ) -> Result<()> {
+    let bootstrap_verifier =
+        Arc::new(crate::oidc_bootstrap::OidcBootstrapVerifier::discover(&config.oidc).await?);
+    serve_with_bootstrap_verifier(config, encryption_key, audit, bootstrap_verifier).await
+}
+
+async fn serve_with_bootstrap_verifier(
+    config: CentralConfig,
+    encryption_key: zeroize::Zeroizing<[u8; 32]>,
+    audit: AuditLogger,
+    bootstrap_verifier: Arc<dyn crate::oidc_bootstrap::BootstrapIdentityVerifier>,
+) -> Result<()> {
     let client = forward::build_client()?;
     let rate_limiter = if config.dev_mode {
         None
@@ -249,6 +262,7 @@ pub async fn serve(
         price_table,
         mcp_manager,
         token_store,
+        bootstrap_verifier,
     };
     let app = router(state);
 
@@ -348,6 +362,7 @@ mod tests {
             price_table: crate::pricing::PriceTable::empty(),
             mcp_manager: crate::mcp::McpManager::new(mcp_db, Zeroizing::new([7_u8; 32])),
             token_store: crate::token_store::TokenStore::new(db),
+            bootstrap_verifier: Arc::new(crate::oidc_bootstrap::UnavailableBootstrapVerifier),
         }
     }
 
@@ -697,7 +712,13 @@ mod tests {
         // Dev-mode serve().
         let dev_config = base_config.clone();
         let dev_task = tokio::spawn(async move {
-            super::serve(dev_config, Zeroizing::new([7_u8; 32]), dev_audit).await
+            super::serve_with_bootstrap_verifier(
+                dev_config,
+                Zeroizing::new([7_u8; 32]),
+                dev_audit,
+                Arc::new(crate::oidc_bootstrap::UnavailableBootstrapVerifier),
+            )
+            .await
         });
 
         // Production mTLS serve().
@@ -746,7 +767,13 @@ mod tests {
         mtls_config.dev_mode = false;
 
         let mtls_task = tokio::spawn(async move {
-            super::serve(mtls_config, Zeroizing::new([7_u8; 32]), mtls_audit).await
+            super::serve_with_bootstrap_verifier(
+                mtls_config,
+                Zeroizing::new([7_u8; 32]),
+                mtls_audit,
+                Arc::new(crate::oidc_bootstrap::UnavailableBootstrapVerifier),
+            )
+            .await
         });
 
         // Wait for the mTLS listener to accept TCP connections.

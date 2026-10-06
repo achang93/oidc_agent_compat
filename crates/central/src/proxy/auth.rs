@@ -19,8 +19,8 @@
 //!   `401 Unauthorized`.
 //! - Attaches the verified identity (from the token record) to the
 //!   request extensions for downstream audit logging and authorization.
-//! - In `dev_mode`, a missing `Authorization` header is allowed (for the
-//!   dev stack and manual curl testing); a warning is logged.
+//! - Authentication remains mandatory in `dev_mode`; that flag relaxes
+//!   transport and rate-limiting behavior, not the identity trust boundary.
 
 use axum::extract::State;
 use axum::http::{Request, StatusCode};
@@ -62,8 +62,7 @@ pub struct VerifiedRelayIdentity {
 /// Extracts the bearer token from the `Authorization` header, verifies it
 /// via `state.token_store.verify_token`, and attaches the verified
 /// identity (from the token record) to the request extensions. Returns
-/// `401 Unauthorized` if the token is missing or unverifiable (unless
-/// `dev_mode` is true, in which case a missing header is allowed).
+/// `401 Unauthorized` if the token is missing or unverifiable in every mode.
 ///
 /// The `X-OAC-Request-Id` header is still read (per-request correlation).
 /// All other `X-OAC-*` identity headers are ignored — the identity comes
@@ -96,15 +95,6 @@ pub async fn auth_middleware(
     let bearer = match bearer {
         Some(b) => b.to_string(),
         None => {
-            if state.config.dev_mode {
-                // In dev mode, allow requests without an Authorization
-                // header (the dev stack's relay forwards a dev token, but
-                // be permissive for manual curl testing).
-                tracing::warn!(
-                    "dev_mode: allowing central request without Authorization bearer token"
-                );
-                return Ok(next.run(request).await);
-            }
             tracing::warn!("rejected central request without Authorization bearer token");
             return Err(StatusCode::UNAUTHORIZED);
         }

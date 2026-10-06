@@ -73,7 +73,6 @@ services:
       dockerfile: docker/dev/Dockerfile
     command: ["oac-relay", "--config", "/config/relay.toml", "serve"]
     environment:
-      OAC_OIDC_CLIENT_SECRET: "oac-relay-secret"
       RUST_LOG: "info"
     ports:
       - "127.0.0.1:8787:8787"

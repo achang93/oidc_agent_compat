@@ -72,6 +72,8 @@ pub struct TokenIdentity {
     pub issuer: String,
     /// The user email, if known.
     pub email: Option<String>,
+    /// The user display name, if known.
+    pub display_name: Option<String>,
     /// The group/role memberships (JSON array string), if known.
     pub groups: Option<String>,
     /// The relay-side identity database ID, if known.
@@ -198,7 +200,7 @@ impl TokenStore {
         let candidate = KeyHash::from_plaintext(plaintext);
         let now = time_util::now_utc();
 
-        let sql = "SELECT id, subject, issuer, email, groups, identity_id, token_hash, \
+        let sql = "SELECT id, subject, issuer, email, display_name, groups, identity_id, token_hash, \
              created_at, expires_at, revoked, device_fingerprint FROM tokens";
         let rows = self
             .db
@@ -214,6 +216,7 @@ impl TokenStore {
         let mut matched_subject: Option<String> = None;
         let mut matched_issuer: Option<String> = None;
         let mut matched_email: Option<String> = None;
+        let mut matched_display_name: Option<String> = None;
         let mut matched_groups: Option<String> = None;
         let mut matched_identity_id: Option<String> = None;
         let mut matched_created: Option<time::PrimitiveDateTime> = None;
@@ -226,6 +229,7 @@ impl TokenStore {
             let row_subject: String = row.try_get("", "subject").unwrap_or_default();
             let row_issuer: String = row.try_get("", "issuer").unwrap_or_default();
             let row_email: Option<String> = row.try_get("", "email").ok();
+            let row_display_name: Option<String> = row.try_get("", "display_name").ok();
             let row_groups: Option<String> = row.try_get("", "groups").ok();
             let row_identity_id: Option<String> = row.try_get("", "identity_id").ok();
             let row_hash: Vec<u8> = row.try_get("", "token_hash").unwrap_or_default();
@@ -246,6 +250,7 @@ impl TokenStore {
                     matched_subject = Some(row_subject);
                     matched_issuer = Some(row_issuer);
                     matched_email = row_email;
+                    matched_display_name = row_display_name;
                     matched_groups = row_groups;
                     matched_identity_id = row_identity_id;
                     matched_created = Some(row_created);
@@ -273,6 +278,7 @@ impl TokenStore {
                 subject: matched_subject.unwrap_or_default(),
                 issuer: matched_issuer.unwrap_or_default(),
                 email: matched_email,
+                display_name: matched_display_name,
                 groups: matched_groups,
                 identity_id: matched_identity_id,
                 created_at: matched_created.unwrap_or(now),

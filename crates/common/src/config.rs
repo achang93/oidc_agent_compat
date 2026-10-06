@@ -7,8 +7,9 @@
 //! # Security
 //!
 //! - The relay rejects `0.0.0.0` as a listen address (must be loopback).
-//! - Secrets are never stored as literals in config; the OIDC client secret
-//!   is referenced by environment-variable name (`client_secret_env`).
+//! - Secrets are never stored as literals in config; central references the
+//!   OIDC client secret by environment-variable name (`client_secret_env`).
+//!   Relay treats that field as unused because it is a public native client.
 //!   Provider API keys are managed through the central admin API and are
 //!   encrypted at rest with `OAC_PROVIDER_ENCRYPTION_KEY`.
 //!
@@ -154,6 +155,7 @@ pub struct OidcConfig {
     /// The client ID registered with the IdP.
     pub client_id: String,
     /// The name of the environment variable holding the client secret.
+    /// Required by central; ignored by the public native relay client.
     pub client_secret_env: String,
     /// The redirect URI (loopback, e.g. `http://127.0.0.1:0/callback`).
     pub redirect_uri: String,
@@ -229,14 +231,13 @@ impl RelayConfig {
     /// - `listen_addr` is not a loopback address (unless `dev_mode` is true).
     /// - `oidc.issuer` is empty or not a valid URL.
     /// - `oidc.client_id` is empty.
-    /// - `oidc.client_secret_env` is empty.
     /// - `oidc.redirect_uri` is not a loopback `http` URL (RFC 8252 §7.3).
     /// - `central.url` is empty or not `https://`.
     pub fn validate(&self) -> Result<()> {
         if !self.dev_mode {
             validate_loopback(&self.listen_addr)?;
         }
-        validate_oidc(&self.oidc)?;
+        validate_oidc(&self.oidc, false)?;
         if !self.dev_mode {
             validate_central_url(&self.central.url)?;
         }
@@ -265,7 +266,7 @@ impl CentralConfig {
     /// fields are zero, or an enabled `[admin]` section has an empty
     /// `admin_group`.
     pub fn validate(&self) -> Result<()> {
-        validate_oidc(&self.oidc)?;
+        validate_oidc(&self.oidc, true)?;
         if self.rate_limit_requests == 0 {
             return Err(Error::Config(
                 "rate_limit_requests must be greater than zero".into(),
@@ -299,7 +300,7 @@ fn validate_loopback(addr: &SocketAddr) -> Result<()> {
 }
 
 /// Validates OIDC config fields.
-fn validate_oidc(oidc: &OidcConfig) -> Result<()> {
+fn validate_oidc(oidc: &OidcConfig, require_client_secret: bool) -> Result<()> {
     if oidc.issuer.is_empty() {
         return Err(Error::Config("oidc.issuer must not be empty".into()));
     }
@@ -312,7 +313,7 @@ fn validate_oidc(oidc: &OidcConfig) -> Result<()> {
     if oidc.client_id.is_empty() {
         return Err(Error::Config("oidc.client_id must not be empty".into()));
     }
-    if oidc.client_secret_env.is_empty() {
+    if require_client_secret && oidc.client_secret_env.is_empty() {
         return Err(Error::Config(
             "oidc.client_secret_env must not be empty".into(),
         ));
@@ -521,10 +522,18 @@ server_key_path = "/server.key"
     }
 
     #[test]
-    fn relay_rejects_empty_client_secret_env() {
+    fn relay_accepts_empty_client_secret_env() {
         let toml = valid_relay_toml()
             .replace("client_secret_env = \"SECRET\"", "client_secret_env = \"\"");
-        let err = RelayConfig::from_toml(&toml).unwrap_err();
+        let config = RelayConfig::from_toml(&toml).expect("public relay needs no secret");
+        assert!(config.oidc.client_secret_env.is_empty());
+    }
+
+    #[test]
+    fn central_rejects_empty_client_secret_env() {
+        let toml = valid_central_toml()
+            .replace("client_secret_env = \"SECRET\"", "client_secret_env = \"\"");
+        let err = CentralConfig::from_toml(&toml).unwrap_err();
         assert!(err.to_string().contains("client_secret_env"), "{err}");
     }
 

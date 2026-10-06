@@ -12,7 +12,7 @@ dev_mode = true
 [oidc]
 issuer = "http://localhost:8080/realms/oac-dev"
 client_id = "oac-relay"
-client_secret_env = "OAC_OIDC_CLIENT_SECRET"
+client_secret_env = ""
 redirect_uri = "http://127.0.0.1:0/callback"
 scopes = ["openid", "email", "profile", "groups"]
 

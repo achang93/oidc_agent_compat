@@ -2,10 +2,10 @@
 //!
 //! These endpoints implement the zero-trust token lifecycle:
 //! - `POST /v1/tokens` — mint a token. In the login flow (no `Authorization`
-//!   header), the identity is carried in the body. In the token-create flow
-//!   (`oac-relay token create`), a valid bearer is present and the identity
-//!   is taken from the verified token record (body carries only `label`
-//!   and `ttl_seconds`).
+//!   header), central exchanges a one-time OIDC authorization code and derives
+//!   identity from the validated ID token or userinfo response. In the
+//!   token-create flow (`oac-relay token create`), a valid bearer is present
+//!   and identity is copied from the verified token record.
 //! - `DELETE /v1/tokens/current` — revoke the token in the `Authorization:
 //!   Bearer` header.
 //! - `DELETE /v1/tokens/{id}` — revoke a specific token by its row id
@@ -15,10 +15,10 @@
 //!
 //! # Security
 //!
-//! - The mint endpoint is authenticated at the transport layer (mTLS in
-//!   production). It does NOT use the existing auth middleware (which trusts
-//!   X-OAC-* headers); instead it resolves the group policy from the request
-//!   body to enforce the admin token-TTL backstop.
+//! - The login mint endpoint is authenticated twice: mTLS authenticates the
+//!   relay transport, then central performs the OIDC authorization-code
+//!   exchange and validates the ID token. Caller-supplied identity fields are
+//!   never accepted.
 //! - The revoke and list endpoints authenticate via the bearer token itself
 //!   (verified against the central token store with constant-time hash
 //!   comparison).
@@ -34,31 +34,26 @@ use oidc_agent_common::identity;
 use oidc_agent_common::keys::extract_bearer;
 use oidc_agent_common::time_util;
 
+use crate::oidc_bootstrap::BootstrapGrant;
 use crate::token_store::MintRequest;
 
 use super::AppState;
 
 /// Request body for `POST /v1/tokens` (mint a token).
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct MintTokenRequest {
-    /// The user subject (from the IdP). Required (validated in handler).
+    /// One-time OIDC authorization code. Required when no bearer is present.
     #[serde(default)]
-    pub subject: String,
-    /// The OIDC issuer. Required (validated in handler).
+    pub authorization_code: String,
+    /// PKCE verifier paired with the authorization request's S256 challenge.
     #[serde(default)]
-    pub issuer: String,
-    /// The user email, if known.
+    pub pkce_verifier: String,
+    /// Exact loopback redirect URI used for the authorization request.
     #[serde(default)]
-    pub email: Option<String>,
-    /// The user display name, if known.
+    pub redirect_uri: String,
+    /// OIDC nonce generated for the authorization request.
     #[serde(default)]
-    pub display_name: Option<String>,
-    /// The group/role memberships (JSON array string), if known.
-    #[serde(default)]
-    pub groups: Option<String>,
-    /// The relay-side identity database ID, if known.
-    #[serde(default)]
-    pub identity_id: Option<String>,
+    pub nonce: String,
     /// Human-readable label. Required (validated in handler).
     #[serde(default)]
     pub label: String,
@@ -77,6 +72,16 @@ pub struct MintTokenResponse {
     pub token_id: String,
     /// When the token expires (RFC 3339 / log format), or `null` for never.
     pub expires_at: Option<String>,
+    /// The issuer validated by central.
+    pub issuer: String,
+    /// The subject validated by central or copied from the verified bearer.
+    pub subject: String,
+    /// The email validated by central, if supplied by the IdP.
+    pub email: Option<String>,
+    /// The display name validated by central, if supplied by the IdP.
+    pub display_name: Option<String>,
+    /// The group/role snapshot validated by central, if supplied by the IdP.
+    pub groups: Option<String>,
 }
 
 /// A single token's metadata in the list response. Never includes the hash or
@@ -97,22 +102,23 @@ pub struct TokenListItem {
 
 /// `POST /v1/tokens` — mints a new opaque token.
 ///
-/// Called by the relay over mTLS during login. Resolves the group policy for
-/// the given groups to enforce the admin token-TTL backstop, clamps the
-/// requested TTL, mints the token, and returns the plaintext. The plaintext
-/// is never logged.
+/// Called by the relay over mTLS during login. Central exchanges and validates
+/// the one-time OIDC grant, resolves the verified groups' policy, clamps the
+/// requested TTL, and returns the plaintext token. The plaintext and OIDC
+/// grant are never logged.
 ///
 /// # Dual authentication modes
 ///
 /// This endpoint serves two callers:
 ///
 /// 1. **Login flow** (relay during OIDC login): no `Authorization` header is
-///    present. The identity (subject, issuer, email, groups, identity_id)
-///    is carried in the request body fields.
+///    present. The body carries a one-time authorization code, PKCE verifier,
+///    loopback redirect URI, and nonce. Central exchanges the code and derives
+///    identity only from the validated IdP response.
 /// 2. **Token-create flow** (`oac-relay token create`): a valid bearer token
 ///    is present in the `Authorization` header. The identity is taken from
-///    the verified token record (subject, issuer, email, groups,
-///    identity_id), and the body fields are used only for `label` and
+///    the verified token record (subject, issuer, email, display name, groups,
+///    identity ID), and the body fields are used only for `label` and
 ///    `ttl_seconds`. This lets an authenticated user mint additional labeled
 ///    tokens for themselves without re-running the OIDC flow.
 pub async fn mint_token_handler(
@@ -127,56 +133,76 @@ pub async fn mint_token_handler(
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
 
-    // Determine the identity source: if a valid bearer is present, use the
-    // verified token record's identity; otherwise fall back to the body
-    // fields (the login flow).
-    let (subject, issuer, email, groups, identity_id) = match extract_bearer_from_headers(&headers)
-    {
-        Some(bearer) => {
-            let verification = state
-                .token_store
-                .verify_token(bearer)
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-                .ok_or((StatusCode::UNAUTHORIZED, "invalid bearer token".into()))?;
-            let id = &verification.identity;
-            (
-                id.subject.clone(),
-                id.issuer.clone(),
-                id.email.clone(),
-                id.groups.clone(),
-                id.identity_id.clone(),
-            )
-        }
-        None => {
-            // Login flow: identity comes from the body fields.
-            if body.subject.trim().is_empty() {
-                return Err((StatusCode::BAD_REQUEST, "subject is required".into()));
-            }
-            if body.issuer.trim().is_empty() {
-                return Err((StatusCode::BAD_REQUEST, "issuer is required".into()));
-            }
-            (
-                body.subject.clone(),
-                body.issuer.clone(),
-                body.email.clone(),
-                body.groups.clone(),
-                body.identity_id.clone(),
-            )
-        }
-    };
-
-    // Validate label (always required, from the body).
+    // Validate non-secret fields before consuming the one-time OIDC code.
     if body.label.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "label is required".into()));
     }
-    // Validate ttl_seconds if provided.
     if body.ttl_seconds.is_some_and(|t| t <= 0) {
         return Err((
             StatusCode::BAD_REQUEST,
             "ttl_seconds must be a positive integer".into(),
         ));
     }
+
+    // Determine the identity source: a verified existing bearer or a fresh
+    // central-validated OIDC code exchange. Never accept identity from JSON.
+    let (subject, issuer, email, display_name, groups, identity_id) =
+        match extract_bearer_from_headers(&headers) {
+            Some(bearer) => {
+                let verification = state
+                    .token_store
+                    .verify_token(bearer)
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                    .ok_or((StatusCode::UNAUTHORIZED, "invalid bearer token".into()))?;
+                let id = &verification.identity;
+                (
+                    id.subject.clone(),
+                    id.issuer.clone(),
+                    id.email.clone(),
+                    id.display_name.clone(),
+                    id.groups.clone(),
+                    id.identity_id.clone(),
+                )
+            }
+            None => {
+                if body.authorization_code.trim().is_empty()
+                    || body.pkce_verifier.trim().is_empty()
+                    || body.redirect_uri.trim().is_empty()
+                    || body.nonce.trim().is_empty()
+                {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "authorization_code, pkce_verifier, redirect_uri, and nonce are required"
+                            .into(),
+                    ));
+                }
+                let verified = state
+                    .bootstrap_verifier
+                    .exchange_and_verify(&BootstrapGrant {
+                        authorization_code: body.authorization_code.clone(),
+                        pkce_verifier: body.pkce_verifier.clone(),
+                        redirect_uri: body.redirect_uri.clone(),
+                        nonce: body.nonce.clone(),
+                    })
+                    .await
+                    .map_err(|error| {
+                        tracing::warn!(error = %error, "OIDC token bootstrap rejected");
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            "OIDC authorization-code exchange failed".into(),
+                        )
+                    })?;
+                (
+                    verified.subject,
+                    verified.issuer,
+                    verified.email,
+                    verified.display_name,
+                    verified.groups,
+                    None,
+                )
+            }
+        };
 
     // Resolve the group policy to get the admin token-TTL backstop.
     let groups_vec: Vec<String> = groups
@@ -202,11 +228,11 @@ pub async fn mint_token_handler(
     let minted = state
         .token_store
         .mint_token(&MintRequest {
-            subject,
-            issuer,
-            email,
-            display_name: body.display_name.clone(),
-            groups,
+            subject: subject.clone(),
+            issuer: issuer.clone(),
+            email: email.clone(),
+            display_name: display_name.clone(),
+            groups: groups.clone(),
             identity_id,
             label: body.label.clone(),
             expires_at,
@@ -222,6 +248,11 @@ pub async fn mint_token_handler(
             token: minted.plaintext.to_string(),
             token_id: minted.token_id,
             expires_at: minted.expires_at.map(|e| time_util::format_time(&e)),
+            issuer,
+            subject,
+            email,
+            display_name,
+            groups,
         }),
     ))
 }
@@ -335,6 +366,37 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
+    struct TestBootstrapVerifier;
+
+    #[async_trait::async_trait]
+    impl crate::oidc_bootstrap::BootstrapIdentityVerifier for TestBootstrapVerifier {
+        async fn exchange_and_verify(
+            &self,
+            grant: &crate::oidc_bootstrap::BootstrapGrant,
+        ) -> oidc_agent_common::error::Result<crate::oidc_bootstrap::BootstrapIdentity> {
+            let subject = grant
+                .authorization_code
+                .strip_prefix("valid:")
+                .filter(|subject| !subject.is_empty())
+                .ok_or_else(|| oidc_agent_common::error::Error::oidc("invalid test grant"))?;
+            if grant.pkce_verifier != "test-verifier"
+                || grant.redirect_uri != "http://127.0.0.1:7777/callback"
+                || grant.nonce != "test-nonce"
+            {
+                return Err(oidc_agent_common::error::Error::oidc(
+                    "invalid test grant binding",
+                ));
+            }
+            Ok(crate::oidc_bootstrap::BootstrapIdentity {
+                issuer: "https://idp.example.com".into(),
+                subject: subject.into(),
+                email: Some(format!("{subject}@example.com")),
+                display_name: Some(format!("Test {subject}")),
+                groups: Some(r#"["engineering"]"#.into()),
+            })
+        }
+    }
+
     /// Builds a minimal dev-mode AppState for token-endpoint tests.
     async fn test_state() -> AppState {
         let url = oidc_agent_common::persistence::temp_sqlite_url("token-api");
@@ -376,6 +438,7 @@ mod tests {
             price_table: crate::pricing::PriceTable::empty(),
             mcp_manager: crate::mcp::McpManager::new(mcp_db, zeroize::Zeroizing::new([7_u8; 32])),
             token_store: crate::token_store::TokenStore::new(db),
+            bootstrap_verifier: std::sync::Arc::new(TestBootstrapVerifier),
         }
     }
 
@@ -385,7 +448,7 @@ mod tests {
             None => String::new(),
         };
         format!(
-            r#"{{"subject": "{subject}", "issuer": "https://idp.example.com", "groups": "[\"engineering\"]", "label": "{label}"{ttl_field}}}"#
+            r#"{{"authorization_code":"valid:{subject}","pkce_verifier":"test-verifier","redirect_uri":"http://127.0.0.1:7777/callback","nonce":"test-nonce","label":"{label}"{ttl_field}}}"#
         )
     }
 
@@ -589,7 +652,7 @@ mod tests {
     async fn post_tokens_without_required_fields_returns_400() {
         let state = test_state().await;
         let app = router(state);
-        // Missing subject.
+        // Missing authorization grant.
         let resp = app
             .clone()
             .oneshot(
@@ -597,9 +660,7 @@ mod tests {
                     .method("POST")
                     .uri("/v1/tokens")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"issuer": "https://idp.example.com", "label": "laptop"}"#,
-                    ))
+                    .body(Body::from(r#"{"label":"laptop"}"#))
                     .expect("request"),
             )
             .await
@@ -614,7 +675,7 @@ mod tests {
                     .uri("/v1/tokens")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"subject": "alice", "issuer": "https://idp.example.com"}"#,
+                        r#"{"authorization_code":"valid:alice","pkce_verifier":"test-verifier","redirect_uri":"http://127.0.0.1:7777/callback","nonce":"test-nonce"}"#,
                     ))
                     .expect("request"),
             )
@@ -714,10 +775,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_tokens_without_issuer_returns_400() {
+    async fn post_tokens_with_rejected_oidc_grant_returns_401() {
         let state = test_state().await;
         let app = router(state);
-        // Missing issuer (empty string).
         let resp = app
             .oneshot(
                 Request::builder()
@@ -725,13 +785,51 @@ mod tests {
                     .uri("/v1/tokens")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"subject": "alice", "issuer": "", "label": "laptop"}"#,
+                        r#"{"authorization_code":"forged","pkce_verifier":"test-verifier","redirect_uri":"http://127.0.0.1:7777/callback","nonce":"test-nonce","label":"laptop"}"#,
                     ))
                     .expect("request"),
             )
             .await
             .expect("router");
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn post_tokens_ignores_caller_supplied_identity_fields() {
+        let state = test_state().await;
+        let app = router(state.clone());
+        let mut body: serde_json::Value =
+            serde_json::from_str(&mint_body("alice", "laptop", Some(3600))).expect("body");
+        body["subject"] = serde_json::json!("mallory");
+        body["issuer"] = serde_json::json!("https://evil.example.com");
+        body["groups"] = serde_json::json!(r#"["oac-admins"]"#);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tokens")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let json = body_json(resp).await;
+        let token = json["token"].as_str().expect("token");
+        let verified = state
+            .token_store
+            .verify_token(token)
+            .await
+            .expect("verify")
+            .expect("verified");
+        assert_eq!(verified.identity.subject, "alice");
+        assert_eq!(verified.identity.issuer, "https://idp.example.com");
+        assert_eq!(
+            verified.identity.groups.as_deref(),
+            Some(r#"["engineering"]"#)
+        );
     }
 
     #[tokio::test]

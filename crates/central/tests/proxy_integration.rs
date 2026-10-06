@@ -18,6 +18,38 @@ use oac_central::provider::{ProviderInput, ProviderStore};
 use oac_central::proxy;
 use zeroize::Zeroizing;
 
+struct TestBootstrapVerifier;
+
+#[async_trait::async_trait]
+impl oac_central::oidc_bootstrap::BootstrapIdentityVerifier for TestBootstrapVerifier {
+    async fn exchange_and_verify(
+        &self,
+        grant: &oac_central::oidc_bootstrap::BootstrapGrant,
+    ) -> oidc_agent_common::error::Result<oac_central::oidc_bootstrap::BootstrapIdentity> {
+        if grant.pkce_verifier != "integration-verifier"
+            || grant.redirect_uri != "http://127.0.0.1:7777/callback"
+            || grant.nonce != "integration-nonce"
+        {
+            return Err(oidc_agent_common::error::Error::oidc(
+                "invalid integration grant binding",
+            ));
+        }
+        let claims: serde_json::Value = serde_json::from_str(&grant.authorization_code)
+            .map_err(|error| oidc_agent_common::error::Error::oidc(error.to_string()))?;
+        let subject = claims["subject"]
+            .as_str()
+            .filter(|subject| !subject.is_empty())
+            .ok_or_else(|| oidc_agent_common::error::Error::oidc("missing test subject"))?;
+        Ok(oac_central::oidc_bootstrap::BootstrapIdentity {
+            issuer: "https://idp.example.com".into(),
+            subject: subject.into(),
+            email: None,
+            display_name: None,
+            groups: claims["groups"].as_str().map(String::from),
+        })
+    }
+}
+
 /// Sets up a test central proxy with a mock backend.
 async fn setup_test_central() -> (SocketAddr, reqwest::Client) {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -116,6 +148,7 @@ async fn setup_test_central() -> (SocketAddr, reqwest::Client) {
             Zeroizing::new([7_u8; 32]),
         ),
         token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
+        bootstrap_verifier: std::sync::Arc::new(TestBootstrapVerifier),
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -126,7 +159,23 @@ async fn setup_test_central() -> (SocketAddr, reqwest::Client) {
         let _ = axum::serve(listener, app).await;
     });
 
-    (addr, reqwest::Client::new())
+    let anonymous = reqwest::Client::new();
+    let token = mint_token_via_api(&anonymous, "http", &addr, "integration-user", None, None).await;
+    (addr, client_with_bearer(&token))
+}
+
+/// Builds a client that authenticates every request with the supplied token.
+fn client_with_bearer(token: &str) -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+            .expect("valid bearer header"),
+    );
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .expect("authenticated client")
 }
 
 /// Mints a token via the central proxy's token API endpoint.
@@ -140,17 +189,17 @@ async fn mint_token_via_api(
     identity_id: Option<&str>,
 ) -> String {
     let url = format!("{scheme}://127.0.0.1:{}/v1/tokens", addr.port());
-    let mut body = serde_json::json!({
-        "subject": subject,
-        "issuer": "https://idp.example.com",
+    let body = serde_json::json!({
+        "authorization_code": serde_json::json!({
+            "subject": subject,
+            "groups": groups,
+        }).to_string(),
+        "pkce_verifier": "integration-verifier",
+        "redirect_uri": "http://127.0.0.1:7777/callback",
+        "nonce": "integration-nonce",
         "label": "integration-test",
     });
-    if let Some(g) = groups {
-        body["groups"] = serde_json::json!(g);
-    }
-    if let Some(id) = identity_id {
-        body["identity_id"] = serde_json::json!(id);
-    }
+    let _ = identity_id;
     let resp = client
         .post(&url)
         .header("content-type", "application/json")
@@ -323,6 +372,7 @@ async fn streaming_response_records_token_usage_after_stream_completes() {
             Zeroizing::new([7_u8; 32]),
         ),
         token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
+        bootstrap_verifier: std::sync::Arc::new(TestBootstrapVerifier),
     };
     // Mint a token before moving state into the router.
     let minted = state
@@ -499,6 +549,7 @@ async fn setup_prod_central() -> (SocketAddr, reqwest::Client) {
             Zeroizing::new([7_u8; 32]),
         ),
         token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
+        bootstrap_verifier: std::sync::Arc::new(TestBootstrapVerifier),
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -730,6 +781,7 @@ async fn setup_mtls_central() -> SocketAddr {
             Zeroizing::new([7_u8; 32]),
         ),
         token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
+        bootstrap_verifier: std::sync::Arc::new(TestBootstrapVerifier),
     };
     let app = proxy::router(state);
 
@@ -985,6 +1037,7 @@ async fn setup_multi_provider_central(
             Zeroizing::new([7_u8; 32]),
         ),
         token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
+        bootstrap_verifier: std::sync::Arc::new(TestBootstrapVerifier),
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1236,6 +1289,7 @@ async fn key_falls_back_on_upstream_401() {
             Zeroizing::new([7_u8; 32]),
         ),
         token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
+        bootstrap_verifier: std::sync::Arc::new(TestBootstrapVerifier),
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1325,6 +1379,7 @@ async fn no_provider_configured_returns_error_without_key_leak() {
             Zeroizing::new([7_u8; 32]),
         ),
         token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
+        bootstrap_verifier: std::sync::Arc::new(TestBootstrapVerifier),
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1335,7 +1390,9 @@ async fn no_provider_configured_returns_error_without_key_leak() {
         let _ = axum::serve(listener, app).await;
     });
 
-    let http = reqwest::Client::new();
+    let anonymous = reqwest::Client::new();
+    let token = mint_token_via_api(&anonymous, "http", &addr, "no-provider-user", None, None).await;
+    let http = client_with_bearer(&token);
     let url = format!("http://127.0.0.1:{}/v1/chat/completions", addr.port());
     let resp = http
         .post(&url)
@@ -1482,6 +1539,7 @@ async fn token_saver_deduplicates_and_audits() {
             Zeroizing::new([7_u8; 32]),
         ),
         token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
+        bootstrap_verifier: std::sync::Arc::new(TestBootstrapVerifier),
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1715,6 +1773,7 @@ async fn ansi_strip_end_to_end() {
             Zeroizing::new([7_u8; 32]),
         ),
         token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
+        bootstrap_verifier: std::sync::Arc::new(TestBootstrapVerifier),
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1893,6 +1952,7 @@ async fn rtk_collapse_repeated_lines_end_to_end() {
             Zeroizing::new([7_u8; 32]),
         ),
         token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
+        bootstrap_verifier: std::sync::Arc::new(TestBootstrapVerifier),
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -2122,6 +2182,7 @@ async fn upstream_failure_releases_request_quota_reservation() {
             Zeroizing::new([7_u8; 32]),
         ),
         token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
+        bootstrap_verifier: std::sync::Arc::new(TestBootstrapVerifier),
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -2294,6 +2355,7 @@ async fn rate_limit_429_through_router_carries_retry_after() {
         price_table: oac_central::pricing::PriceTable::empty(),
         mcp_manager: oac_central::mcp::McpManager::new(db.clone(), Zeroizing::new([7_u8; 32])),
         token_store: oac_central::token_store::TokenStore::new(db.clone()),
+        bootstrap_verifier: std::sync::Arc::new(TestBootstrapVerifier),
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
